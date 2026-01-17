@@ -74,17 +74,57 @@ python3 -m src.main buy --help
 3. **Cálculo de precio óptimo**: Coloca la orden a `best_bid + 1 CLP` para ser el primero en la fila
 4. **Colocación de orden límite**: Crea una orden de compra (Bid) al precio calculado
 5. **Monitoreo continuo**: Cada 30 segundos (configurable):
-   - Si la orden se ejecutó → termina exitosamente
+   - Si la orden se ejecutó completamente → termina con resumen
    - Si seguimos siendo best bid → espera
-   - Si nos superaron → cancela la orden y coloca una nueva con mejor precio
+   - Si nos superaron → cancela, trackea ejecución parcial, y coloca nueva orden con el monto restante
+   - Si el monto restante es menor al mínimo → termina con resumen
 
 ## Características
 
 - Mantiene automáticamente la mejor posición de compra
 - Reposiciona la orden si otro comprador ofrece más
-- Cancela órdenes pendientes al salir con `Ctrl+C`
+- **Manejo de ejecuciones parciales**: si parte de la orden se ejecuta antes de reposicionar, el bot continúa solo con el monto restante
+- Cancela órdenes pendientes al salir con `Ctrl+C` y muestra resumen de ejecución
 - Manejo de rate limits con reintentos automáticos
 - Modo dry-run para probar sin riesgo
+
+## Manejo de Ejecuciones Parciales
+
+El bot trackea correctamente las ejecuciones parciales durante el proceso de compra:
+
+1. **Durante el monitoreo**: Si la orden se ejecuta parcialmente, el bot registra el crypto recibido y CLP gastado
+2. **Al reposicionar**: Si nos superan en precio, el bot cancela la orden y coloca una nueva solo con el CLP restante
+3. **Monto mínimo**: Si el CLP restante es menor al mínimo (BTC: 2,000 / USDC: 1,000), el bot termina exitosamente
+4. **Resumen final**: Al terminar (ya sea por completar la orden o por `Ctrl+C`), muestra un resumen con:
+   - CLP total gastado
+   - Crypto total recibido
+   - Precio promedio de compra
+
+### Ejemplo de Ejecución Parcial
+
+```
+[!] Outbid! Our price: $84.429.573 CLP, Best bid: $84.429.580 CLP
+[+] Partial execution before cancel: 0.00005000 BTC
+[*] Progress: $4.221 CLP / $10.000 CLP (42.2%)
+[*] Crypto received: 0.00005000 BTC
+[*] Remaining: $5.779 CLP
+[*] New optimal price: $84.429.581 CLP
+[*] Order amount: 0.00006847 BTC ($5.779 CLP)
+[+] New order placed! ID: 123457
+```
+
+### Resumen Final
+
+```
+[*] ==================================================
+[*] EXECUTION SUMMARY
+[*] ==================================================
+[*] Target: $10.000 CLP
+[+] Executed: $10.000 CLP
+[+] Crypto received: 0.00011844 BTC
+[*] Average price: $84.429.576 CLP
+[*] ==================================================
+```
 
 ## Estructura del Proyecto
 
