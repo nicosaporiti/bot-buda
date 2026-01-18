@@ -176,6 +176,20 @@ class BudaClient:
         response = self._make_request("GET", f"/balances/{currency.lower()}")
         return response.get("balance", response)
 
+    def get_balances(self) -> list[dict]:
+        """
+        Get balances for all currencies.
+
+        Returns:
+            List of balance dictionaries.
+        """
+        response = self._make_request("GET", "/balances")
+        if isinstance(response, dict) and isinstance(response.get("balances"), list):
+            return response["balances"]
+        if isinstance(response, list):
+            return response
+        return []
+
     def get_order_book(self, market_id: str) -> dict:
         """
         Get the order book for a specific market.

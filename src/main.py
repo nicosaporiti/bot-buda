@@ -60,8 +60,8 @@ Examples:
         "currency",
         type=str,
         nargs="?",
-        default="clp",
-        help="Currency to check (default: clp)"
+        default=None,
+        help="Currency to check (default: all)"
     )
 
     # Orderbook command (for testing)
@@ -107,10 +107,7 @@ def cmd_buy(args, client: BudaClient) -> int:
 
 def cmd_balance(args, client: BudaClient) -> int:
     """Execute the balance command."""
-    currency = args.currency.lower()
-
-    try:
-        balance = client.get_balance(currency)
+    def _print_balance(balance: dict, currency: str) -> None:
         available = balance.get("available_amount", ["0", currency.upper()])
         frozen = balance.get("frozen_amount", ["0", currency.upper()])
 
@@ -123,6 +120,24 @@ def cmd_balance(args, client: BudaClient) -> int:
             print(f"  Frozen: {frozen[0]} {frozen[1]}")
         else:
             print(f"  Frozen: {frozen}")
+
+    try:
+        if args.currency:
+            currency = args.currency.lower()
+            balance = client.get_balance(currency)
+            _print_balance(balance, currency)
+        else:
+            balances = client.get_balances()
+            if not balances:
+                print("No balances found.")
+                return 0
+            for balance in balances:
+                currency = balance.get("id")
+                if not currency and isinstance(balance.get("available_amount"), list):
+                    currency = balance["available_amount"][1]
+                currency = currency or "unknown"
+                _print_balance(balance, currency)
+                print()
 
         return 0
     except BudaAPIError as e:

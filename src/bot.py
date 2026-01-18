@@ -3,7 +3,7 @@
 import signal
 import sys
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from typing import Optional, Tuple
 
 from .api import BudaClient, BudaAPIError, InsufficientBalanceError
@@ -12,7 +12,6 @@ from .utils import (
     format_crypto,
     parse_order_book_entry,
     calculate_amount_for_clp,
-    round_price_up,
     print_status,
     print_order_info,
 )
@@ -24,13 +23,19 @@ class TradingBot:
     # Minimum order amounts per market (in crypto)
     MIN_AMOUNTS = {
         "btc-clp": Decimal("0.00002"),
-        "usdc-clp": Decimal("1.0"),
+        "usdc-clp": Decimal("0.01"),
     }
 
     # Minimum order value in CLP per market
     MIN_CLP = {
         "btc-clp": Decimal("2000"),
-        "usdc-clp": Decimal("1000"),
+        "usdc-clp": Decimal("10"),
+    }
+
+    # Price tick size per market (CLP)
+    PRICE_TICKS = {
+        "btc-clp": Decimal("1"),
+        "usdc-clp": Decimal("0.01"),
     }
 
     def __init__(
@@ -54,7 +59,8 @@ class TradingBot:
         self.market_id = f"{self.currency}-clp"
         self.interval = interval
         self.dry_run = dry_run
-        self.min_amount = self.MIN_AMOUNTS.get(self.market_id, Decimal("0.00001"))
+        self.min_amount = self.MIN_AMOUNTS.get(
+            self.market_id, Decimal("0.00001"))
 
         self._current_order_id: Optional[str] = None
         self._running = False
@@ -77,16 +83,19 @@ class TradingBot:
         if self._current_order_id and not self.dry_run:
             try:
                 # Check for partial execution before canceling
-                state, traded_crypto, order_price, traded_clp = self.get_order_state(self._current_order_id)
+                state, traded_crypto, order_price, traded_clp = self.get_order_state(
+                    self._current_order_id)
 
-                print_status(f"Canceling active order {self._current_order_id}...", "INFO")
+                print_status(
+                    f"Canceling active order {self._current_order_id}...", "INFO")
                 self.client.cancel_order(self._current_order_id)
                 print_status("Order canceled successfully.", "OK")
 
                 # Track any partial execution from the canceled order
                 if traded_crypto > 0:
                     self.update_execution_tracking(traded_crypto, traded_clp)
-                    print_status(f"Partial execution captured: {format_crypto(traded_crypto, self.currency)}", "INFO")
+                    print_status(
+                        f"Partial execution captured: {format_crypto(traded_crypto, self.currency)}", "INFO")
 
             except BudaAPIError as e:
                 print_status(f"Failed to cancel order: {e}", "ERROR")
@@ -150,12 +159,30 @@ class TradingBot:
 
         return best_bid, best_ask
 
+    def _price_tick(self) -> Decimal:
+        """Return the minimum price increment for the current market."""
+        return self.PRICE_TICKS.get(self.market_id, Decimal("1"))
+
+    def _round_price_up(self, price: Decimal) -> Decimal:
+        """Round price up to the market tick size."""
+        tick = self._price_tick()
+        return price.quantize(tick, rounding=ROUND_UP)
+
+    def _format_limit_price(self, price: Decimal) -> str:
+        """Format limit price for the API based on market tick size."""
+        tick = self._price_tick()
+        quantized = price.quantize(tick)
+        if tick == Decimal("1"):
+            return str(int(quantized))
+        decimals = abs(tick.as_tuple().exponent)
+        return f"{quantized:.{decimals}f}"
+
     def calculate_optimal_price(self, best_bid: Decimal, best_ask: Decimal) -> Decimal:
         """
         Calculate the optimal bid price to be at the top of the order book.
 
-        The optimal price is best_bid + 1 CLP, but must be less than best_ask
-        to avoid immediate execution.
+        The optimal price is best_bid + tick size (1 CLP for BTC, 0.01 for USDC),
+        but must be less than best_ask to avoid immediate execution.
 
         Args:
             best_bid: Current best bid price.
@@ -164,11 +191,12 @@ class TradingBot:
         Returns:
             Optimal bid price.
         """
-        optimal = round_price_up(best_bid + 1)
+        tick = self._price_tick()
+        optimal = self._round_price_up(best_bid + tick)
 
         # Ensure we don't cross the spread
         if optimal >= best_ask:
-            optimal = round_price_up(best_bid)
+            optimal = self._round_price_up(best_bid)
 
         return optimal
 
@@ -221,6 +249,7 @@ class TradingBot:
             Order information.
         """
         if self.dry_run:
+            limit_price = self._format_limit_price(price)
             print_status("[DRY RUN] Would place order:", "INFO")
             print(f"    Amount: {format_crypto(amount, self.currency)}")
             print(f"    Price: {format_clp(price)}")
@@ -229,14 +258,14 @@ class TradingBot:
                 "id": "dry-run-order",
                 "state": "pending",
                 "amount": [str(amount), self.currency.upper()],
-                "limit": [str(int(price)), "CLP"],
+                "limit": [limit_price, "CLP"],
             }
 
         order = self.client.create_limit_order(
             market_id=self.market_id,
             order_type="Bid",
             amount=str(amount),
-            limit_price=str(int(price))
+            limit_price=self._format_limit_price(price)
         )
 
         self._current_order_id = order.get("id")
@@ -253,7 +282,8 @@ class TradingBot:
             return True
 
         if self.dry_run:
-            print_status(f"[DRY RUN] Would cancel order {self._current_order_id}", "INFO")
+            print_status(
+                f"[DRY RUN] Would cancel order {self._current_order_id}", "INFO")
             self._current_order_id = None
             return True
 
@@ -338,12 +368,14 @@ class TradingBot:
     def print_progress(self) -> None:
         """Print current execution progress."""
         remaining = self.calculate_remaining_clp()
-        progress_pct = (self._total_clp_executed / self._total_clp_target * 100) if self._total_clp_target > 0 else Decimal("0")
+        progress_pct = (self._total_clp_executed / self._total_clp_target *
+                        100) if self._total_clp_target > 0 else Decimal("0")
         print_status(
             f"Progress: {format_clp(self._total_clp_executed)} / {format_clp(self._total_clp_target)} ({progress_pct:.1f}%)",
             "INFO"
         )
-        print_status(f"Crypto received: {format_crypto(self._total_crypto_received, self.currency)}", "INFO")
+        print_status(
+            f"Crypto received: {format_crypto(self._total_crypto_received, self.currency)}", "INFO")
         print_status(f"Remaining: {format_clp(remaining)}", "INFO")
 
     def print_final_summary(self) -> None:
@@ -354,13 +386,15 @@ class TradingBot:
         print_status("=" * 50, "INFO")
         print_status(f"Target: {format_clp(self._total_clp_target)}", "INFO")
         print_status(f"Executed: {format_clp(self._total_clp_executed)}", "OK")
-        print_status(f"Crypto received: {format_crypto(self._total_crypto_received, self.currency)}", "OK")
+        print_status(
+            f"Crypto received: {format_crypto(self._total_crypto_received, self.currency)}", "OK")
         if self._total_crypto_received > 0:
             avg_price = self._total_clp_executed / self._total_crypto_received
             print_status(f"Average price: {format_clp(avg_price)}", "INFO")
         remaining = self.calculate_remaining_clp()
         if remaining > 0:
-            print_status(f"Remaining (not executed): {format_clp(remaining)}", "WARN")
+            print_status(
+                f"Remaining (not executed): {format_clp(remaining)}", "WARN")
         print_status("=" * 50, "INFO")
 
     def execute_buy_order(self, clp_amount: Decimal) -> None:
@@ -410,8 +444,10 @@ class TradingBot:
         amount = self.calculate_crypto_amount(clp_amount, optimal_price)
 
         print_status(f"Optimal price: {format_clp(optimal_price)}", "INFO")
-        print_status(f"Order amount: {format_crypto(amount, self.currency)}", "INFO")
-        print_status(f"Estimated total: {format_clp(amount * optimal_price)}", "INFO")
+        print_status(
+            f"Order amount: {format_crypto(amount, self.currency)}", "INFO")
+        print_status(
+            f"Estimated total: {format_clp(amount * optimal_price)}", "INFO")
         print()
 
         # Step 4: Place initial order
@@ -439,13 +475,15 @@ class TradingBot:
                     break
 
                 # Check order state
-                state, traded_crypto, order_price, traded_clp = self.get_order_state(order_id)
+                state, traded_crypto, order_price, traded_clp = self.get_order_state(
+                    order_id)
 
                 # Check for partial fills on current order
                 new_traded_crypto = traded_crypto - last_traded_crypto
                 new_traded_clp = traded_clp - last_traded_clp
                 if new_traded_crypto > 0:
-                    print_status(f"Partial fill: +{format_crypto(new_traded_crypto, self.currency)}", "OK")
+                    print_status(
+                        f"Partial fill: +{format_crypto(new_traded_crypto, self.currency)}", "OK")
                     last_traded_crypto = traded_crypto
                     last_traded_clp = traded_clp
 
@@ -459,7 +497,8 @@ class TradingBot:
 
                 if state == "canceled_and_traded":
                     # Partial execution + canceled (can happen from external cancel)
-                    print_status("Order was partially executed and canceled.", "WARN")
+                    print_status(
+                        "Order was partially executed and canceled.", "WARN")
                     self.update_execution_tracking(traded_crypto, traded_clp)
                     self.print_progress()
                     self._current_order_id = None
@@ -467,15 +506,19 @@ class TradingBot:
                     # Check if we can continue
                     remaining_clp = self.calculate_remaining_clp()
                     if not self.can_place_new_order(remaining_clp):
-                        print_status(f"Remaining {format_clp(remaining_clp)} is below minimum. Finishing.", "WARN")
+                        print_status(
+                            f"Remaining {format_clp(remaining_clp)} is below minimum. Finishing.", "WARN")
                         self.print_final_summary()
                         return
 
                     # Place new order with remaining amount
                     best_bid, best_ask = self.get_best_prices()
-                    optimal_price = self.calculate_optimal_price(best_bid, best_ask)
-                    amount = self.calculate_crypto_amount(remaining_clp, optimal_price)
-                    print_status(f"Placing new order with remaining {format_clp(remaining_clp)}", "INFO")
+                    optimal_price = self.calculate_optimal_price(
+                        best_bid, best_ask)
+                    amount = self.calculate_crypto_amount(
+                        remaining_clp, optimal_price)
+                    print_status(
+                        f"Placing new order with remaining {format_clp(remaining_clp)}", "INFO")
                     order = self.place_order(amount, optimal_price)
                     order_id = order.get("id")
                     current_price = optimal_price
@@ -508,31 +551,40 @@ class TradingBot:
 
                     # Cancel current order - may result in partial fill
                     if not self.cancel_current_order():
-                        print_status("Could not cancel order. Retrying...", "WARN")
+                        print_status(
+                            "Could not cancel order. Retrying...", "WARN")
                         continue
 
                     # Re-fetch order state after cancellation to capture any partial fills
-                    state, traded_crypto, order_price, traded_clp = self.get_order_state(order_id)
+                    state, traded_crypto, order_price, traded_clp = self.get_order_state(
+                        order_id)
 
                     # Track any execution that happened before cancellation
                     if traded_crypto > 0:
-                        self.update_execution_tracking(traded_crypto, traded_clp)
-                        print_status(f"Partial execution before cancel: {format_crypto(traded_crypto, self.currency)}", "INFO")
+                        self.update_execution_tracking(
+                            traded_crypto, traded_clp)
+                        print_status(
+                            f"Partial execution before cancel: {format_crypto(traded_crypto, self.currency)}", "INFO")
                         self.print_progress()
 
                     # Check if we can place a new order
                     remaining_clp = self.calculate_remaining_clp()
                     if not self.can_place_new_order(remaining_clp):
-                        print_status(f"Remaining {format_clp(remaining_clp)} is below minimum. Finishing.", "WARN")
+                        print_status(
+                            f"Remaining {format_clp(remaining_clp)} is below minimum. Finishing.", "WARN")
                         self.print_final_summary()
                         return
 
                     # Recalculate price and amount with remaining CLP
-                    optimal_price = self.calculate_optimal_price(best_bid, best_ask)
-                    amount = self.calculate_crypto_amount(remaining_clp, optimal_price)
+                    optimal_price = self.calculate_optimal_price(
+                        best_bid, best_ask)
+                    amount = self.calculate_crypto_amount(
+                        remaining_clp, optimal_price)
 
-                    print_status(f"New optimal price: {format_clp(optimal_price)}", "INFO")
-                    print_status(f"Order amount: {format_crypto(amount, self.currency)} ({format_clp(remaining_clp)})", "INFO")
+                    print_status(
+                        f"New optimal price: {format_clp(optimal_price)}", "INFO")
+                    print_status(
+                        f"Order amount: {format_crypto(amount, self.currency)} ({format_clp(remaining_clp)})", "INFO")
 
                     # Place new order
                     order = self.place_order(amount, optimal_price)

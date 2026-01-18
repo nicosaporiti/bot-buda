@@ -15,8 +15,17 @@ def format_clp(amount: float | str | Decimal) -> str:
         Formatted string (e.g., "1,234,567 CLP").
     """
     amount = Decimal(str(amount))
-    formatted = f"{int(amount):,}".replace(",", ".")
-    return f"${formatted} CLP"
+    sign = "-" if amount < 0 else ""
+    amount = abs(amount)
+
+    quantized = amount.quantize(Decimal("0.01"))
+    formatted_int = f"{int(quantized):,}".replace(",", ".")
+
+    if quantized == quantized.to_integral_value():
+        return f"{sign}${formatted_int} CLP"
+
+    decimals = f"{quantized:.2f}".split(".")[1]
+    return f"{sign}${formatted_int},{decimals} CLP"
 
 
 def format_crypto(amount: float | str | Decimal, currency: str) -> str:
