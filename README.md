@@ -19,6 +19,16 @@ BUDA_API_KEY=tu_api_key
 BUDA_API_SECRET=tu_api_secret
 ```
 
+## Realtime (WebSocket)
+
+El bot usa WebSocket para obtener el order book en tiempo real y reaccionar más rápido. Si el WebSocket no entrega datos o queda stale, el bot hace fallback a REST automáticamente.
+
+Opcional para debugging de mensajes WS:
+
+```bash
+BUDA_WS_DEBUG=1 BUDA_WS_DEBUG_LIMIT=5 python3 -m src.main buy usdc 300
+```
+
 ## Comandos Disponibles
 
 ### Comprar Criptomonedas
@@ -70,10 +80,10 @@ python3 -m src.main buy --help
 ## Cómo Funciona
 
 1. **Verificación de saldo**: Confirma que tienes suficiente CLP
-2. **Análisis del order book**: Obtiene el mejor precio de compra (best bid) y venta (best ask)
+2. **Order book en tiempo real**: Se conecta por WebSocket y mantiene el best bid/ask (con fallback REST)
 3. **Cálculo de precio óptimo**: Coloca la orden a `best_bid + 1 CLP` para ser el primero en la fila
 4. **Colocación de orden límite**: Crea una orden de compra (Bid) al precio calculado
-5. **Monitoreo continuo**: Cada 30 segundos (configurable):
+5. **Monitoreo continuo**: Reacciona a cambios en el book o cada `interval` segundos (configurable):
    - Si la orden se ejecutó completamente → termina con resumen
    - Si seguimos siendo best bid → espera
    - Si nos superaron → cancela, trackea ejecución parcial, y coloca nueva orden con el monto restante
@@ -85,6 +95,8 @@ python3 -m src.main buy --help
 - Reposiciona la orden si otro comprador ofrece más
 - **Manejo de ejecuciones parciales**: si parte de la orden se ejecuta antes de reposicionar, el bot continúa solo con el monto restante
 - Cancela órdenes pendientes al salir con `Ctrl+C` y muestra resumen de ejecución
+- **Order book en tiempo real (WebSocket)** con fallback a REST si el stream falla o queda stale
+- **Sanity check REST periódico** para mantener consistencia del book
 - Manejo de rate limits con reintentos automáticos
 - Modo dry-run para probar sin riesgo
 
@@ -139,6 +151,7 @@ bot-buda/
     ├── auth.py             # Autenticación HMAC-SHA384
     ├── api.py              # Cliente API de Buda
     ├── bot.py              # Lógica de trading
+    ├── ws.py               # Realtime WebSocket + estado del order book
     └── utils.py            # Funciones auxiliares
 ```
 
@@ -182,3 +195,24 @@ $ python3 -m src.main buy btc 10000
 - El bot calcula automáticamente cuánto crypto puede comprar
 - **Monto mínimo BTC:** 2,000 CLP
 - **Monto mínimo USDC:** 1,000 CLP
+- El WebSocket usa certificados de `certifi` para evitar errores SSL
+
+## Troubleshooting WS
+
+### SSL: CERTIFICATE_VERIFY_FAILED
+
+Si ves errores SSL al conectar al WebSocket:
+
+1. Asegúrate de tener `certifi` instalado (`pip install -r requirements.txt`)
+2. Reintenta la ejecución
+
+### Realtime book not ready / stale
+
+- Si aparece `Realtime book not ready`, es porque aún no llegó un snapshot o el primer update; se usa REST en ese momento.
+- Si aparece `Realtime book stale`, el stream no está entregando actualizaciones y se hace fallback a REST.
+
+Para inspeccionar los mensajes WS:
+
+```bash
+BUDA_WS_DEBUG=1 BUDA_WS_DEBUG_LIMIT=5 python3 -m src.main buy usdc 300
+```

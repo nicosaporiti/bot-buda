@@ -190,6 +190,16 @@ class BudaClient:
             return response
         return []
 
+    def get_me(self) -> dict:
+        """
+        Get authenticated user info (includes pubsub_key for WebSocket).
+
+        Returns:
+            User information.
+        """
+        response = self._make_request("GET", "/me")
+        return response.get("user", response)
+
     def get_order_book(self, market_id: str) -> dict:
         """
         Get the order book for a specific market.
