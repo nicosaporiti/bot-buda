@@ -14,7 +14,7 @@ from .utils import format_clp, print_status
 def create_parser() -> argparse.ArgumentParser:
     """Create the argument parser."""
     parser = argparse.ArgumentParser(
-        description="Buda.com Trading Bot - Maintain best bid position",
+        description="Buda.com Trading Bot - Maintain best bid/ask position",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -22,6 +22,8 @@ Examples:
   python -m src.main buy usdc 50000        # Buy USDC with 50,000 CLP
   python -m src.main buy btc 100000 --interval 60   # Check every 60 seconds
   python -m src.main buy btc 100000 --dry-run       # Simulate without trading
+  python -m src.main sell btc 0.001        # Sell 0.001 BTC
+  python -m src.main sell usdc 50          # Sell 50 USDC
         """
     )
 
@@ -48,6 +50,33 @@ Examples:
         help="Monitoring interval in seconds (default: 30)"
     )
     buy_parser.add_argument(
+        "--dry-run",
+        "-d",
+        action="store_true",
+        help="Simulate without placing real orders"
+    )
+
+    # Sell command
+    sell_parser = subparsers.add_parser("sell", help="Place and maintain a sell order")
+    sell_parser.add_argument(
+        "currency",
+        type=str,
+        choices=["btc", "usdc", "BTC", "USDC"],
+        help="Currency to sell (btc or usdc)"
+    )
+    sell_parser.add_argument(
+        "amount",
+        type=str,
+        help="Amount of crypto to sell"
+    )
+    sell_parser.add_argument(
+        "--interval",
+        "-i",
+        type=int,
+        default=30,
+        help="Monitoring interval in seconds (default: 30)"
+    )
+    sell_parser.add_argument(
         "--dry-run",
         "-d",
         action="store_true",
@@ -99,6 +128,34 @@ def cmd_buy(args, client: BudaClient) -> int:
 
     try:
         bot.execute_buy_order(clp_amount)
+        return 0
+    except BudaAPIError as e:
+        print_status(f"Trading error: {e}", "ERROR")
+        return 1
+
+
+def cmd_sell(args, client: BudaClient) -> int:
+    """Execute the sell command."""
+    currency = args.currency.lower()
+    crypto_amount = Decimal(str(args.amount))
+
+    if crypto_amount <= 0:
+        print_status("Amount must be positive", "ERROR")
+        return 1
+
+    print_status(f"Buda.com Trading Bot", "INFO")
+    print_status(f"=" * 40, "INFO")
+    print()
+
+    bot = TradingBot(
+        client=client,
+        currency=currency,
+        interval=args.interval,
+        dry_run=args.dry_run
+    )
+
+    try:
+        bot.execute_sell_order(crypto_amount)
         return 0
     except BudaAPIError as e:
         print_status(f"Trading error: {e}", "ERROR")
@@ -200,6 +257,8 @@ def main() -> int:
     try:
         if args.command == "buy":
             return cmd_buy(args, client)
+        elif args.command == "sell":
+            return cmd_sell(args, client)
         elif args.command == "balance":
             return cmd_balance(args, client)
         elif args.command == "orderbook":

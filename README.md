@@ -1,6 +1,6 @@
 # Bot de Trading para Buda.com
 
-Bot CLI en Python para comprar BTC o USDC en Buda.com con órdenes límite que mantienen la mejor posición de compra (best bid) automáticamente.
+Bot CLI en Python para comprar y vender BTC o USDC en Buda.com con órdenes límite que mantienen la mejor posición (best bid/ask) automáticamente.
 
 ## Instalación
 
@@ -47,6 +47,22 @@ python3 -m src.main buy btc 100000 --interval 60
 python3 -m src.main buy btc 100000 --dry-run
 ```
 
+### Vender Criptomonedas
+
+```bash
+# Vender 0.001 BTC
+python3 -m src.main sell btc 0.001
+
+# Vender 50 USDC
+python3 -m src.main sell usdc 50
+
+# Cambiar intervalo de monitoreo a 60 segundos (default: 30)
+python3 -m src.main sell btc 0.001 --interval 60
+
+# Modo simulación (no ejecuta órdenes reales)
+python3 -m src.main sell btc 0.001 --dry-run
+```
+
 ### Consultar Balance
 
 ```bash
@@ -79,10 +95,10 @@ python3 -m src.main buy --help
 
 ## Cómo Funciona
 
-1. **Verificación de saldo**: Confirma que tienes suficiente CLP
+1. **Verificación de saldo**: Confirma que tienes suficiente CLP o crypto
 2. **Order book en tiempo real**: Se conecta por WebSocket y mantiene el best bid/ask (con fallback REST)
-3. **Cálculo de precio óptimo**: Coloca la orden a `best_bid + 1 CLP` para ser el primero en la fila
-4. **Colocación de orden límite**: Crea una orden de compra (Bid) al precio calculado
+3. **Cálculo de precio óptimo**: Coloca la orden a `best_bid + tick` para comprar o `best_ask - tick` para vender
+4. **Colocación de orden límite**: Crea una orden de compra (Bid) o venta (Ask) al precio calculado
 5. **Monitoreo continuo**: Reacciona a cambios en el book o cada `interval` segundos (configurable):
    - Si la orden se ejecutó completamente → termina con resumen
    - Si seguimos siendo best bid → espera
@@ -91,7 +107,7 @@ python3 -m src.main buy --help
 
 ## Características
 
-- Mantiene automáticamente la mejor posición de compra
+- Mantiene automáticamente la mejor posición de compra/venta
 - Reposiciona la orden si otro comprador ofrece más
 - **Manejo de ejecuciones parciales**: si parte de la orden se ejecuta antes de reposicionar, el bot continúa solo con el monto restante
 - Cancela órdenes pendientes al salir con `Ctrl+C` y muestra resumen de ejecución
@@ -191,10 +207,12 @@ $ python3 -m src.main buy btc 10000
 
 ## Notas
 
-- El monto siempre se especifica en CLP
+- En compras el monto se especifica en CLP; en ventas, en crypto
 - El bot calcula automáticamente cuánto crypto puede comprar
 - **Monto mínimo BTC:** 2,000 CLP
 - **Monto mínimo USDC:** 1,000 CLP
+- **Monto mínimo venta BTC:** 0.00002 BTC
+- **Monto mínimo venta USDC:** 0.01 USDC
 - El WebSocket usa certificados de `certifi` para evitar errores SSL
 
 ## Troubleshooting WS
