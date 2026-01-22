@@ -22,8 +22,10 @@ Examples:
   python -m src.main buy usdc 50000        # Buy USDC with 50,000 CLP
   python -m src.main buy btc 100000 --interval 60   # Check every 60 seconds
   python -m src.main buy btc 100000 --dry-run       # Simulate without trading
+  python -m src.main buy btc 100000 --strategy depth --depth 0.9
   python -m src.main sell btc 0.001        # Sell 0.001 BTC
   python -m src.main sell usdc 50          # Sell 50 USDC
+  python -m src.main sell btc 0.001 --strategy depth --depth 0.9
         """
     )
 
@@ -55,6 +57,20 @@ Examples:
         action="store_true",
         help="Simulate without placing real orders"
     )
+    buy_parser.add_argument(
+        "--strategy",
+        "-s",
+        type=str,
+        choices=["top", "depth"],
+        default="top",
+        help="Pricing strategy: top (best bid/ask) or depth (cumulative volume)"
+    )
+    buy_parser.add_argument(
+        "--depth",
+        type=float,
+        default=0.9,
+        help="Depth ratio for strategy=depth (0-1, default: 0.9)"
+    )
 
     # Sell command
     sell_parser = subparsers.add_parser("sell", help="Place and maintain a sell order")
@@ -81,6 +97,20 @@ Examples:
         "-d",
         action="store_true",
         help="Simulate without placing real orders"
+    )
+    sell_parser.add_argument(
+        "--strategy",
+        "-s",
+        type=str,
+        choices=["top", "depth"],
+        default="top",
+        help="Pricing strategy: top (best bid/ask) or depth (cumulative volume)"
+    )
+    sell_parser.add_argument(
+        "--depth",
+        type=float,
+        default=0.9,
+        help="Depth ratio for strategy=depth (0-1, default: 0.9)"
     )
 
     # Balance command (for testing)
@@ -110,9 +140,13 @@ def cmd_buy(args, client: BudaClient) -> int:
     """Execute the buy command."""
     currency = args.currency.lower()
     clp_amount = Decimal(args.amount)
+    depth_ratio = Decimal(str(args.depth))
 
     if clp_amount <= 0:
         print_status("Amount must be positive", "ERROR")
+        return 1
+    if not (Decimal("0") < depth_ratio <= Decimal("1")):
+        print_status("Depth ratio must be between 0 and 1", "ERROR")
         return 1
 
     print_status(f"Buda.com Trading Bot", "INFO")
@@ -123,7 +157,9 @@ def cmd_buy(args, client: BudaClient) -> int:
         client=client,
         currency=currency,
         interval=args.interval,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        strategy=args.strategy,
+        depth_ratio=depth_ratio,
     )
 
     try:
@@ -138,9 +174,13 @@ def cmd_sell(args, client: BudaClient) -> int:
     """Execute the sell command."""
     currency = args.currency.lower()
     crypto_amount = Decimal(str(args.amount))
+    depth_ratio = Decimal(str(args.depth))
 
     if crypto_amount <= 0:
         print_status("Amount must be positive", "ERROR")
+        return 1
+    if not (Decimal("0") < depth_ratio <= Decimal("1")):
+        print_status("Depth ratio must be between 0 and 1", "ERROR")
         return 1
 
     print_status(f"Buda.com Trading Bot", "INFO")
@@ -151,7 +191,9 @@ def cmd_sell(args, client: BudaClient) -> int:
         client=client,
         currency=currency,
         interval=args.interval,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        strategy=args.strategy,
+        depth_ratio=depth_ratio,
     )
 
     try:

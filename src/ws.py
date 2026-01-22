@@ -61,6 +61,11 @@ class OrderBookState:
             best_ask = min(self._asks.keys())
             return best_bid, best_ask
 
+    def get_snapshot(self) -> Tuple[Dict[Decimal, Decimal], Dict[Decimal, Decimal]]:
+        """Return copies of the current bids and asks."""
+        with self._lock:
+            return dict(self._bids), dict(self._asks)
+
     def reset(self) -> None:
         """Clear book and readiness state."""
         with self._lock:

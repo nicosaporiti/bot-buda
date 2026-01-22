@@ -40,6 +40,9 @@ python3 -m src.main buy btc 100000
 # Comprar USDC con 50,000 CLP
 python3 -m src.main buy usdc 50000
 
+# Comprar usando estrategia por profundidad (90% del volumen)
+python3 -m src.main buy btc 100000 --strategy depth --depth 0.9
+
 # Cambiar intervalo de monitoreo a 60 segundos (default: 30)
 python3 -m src.main buy btc 100000 --interval 60
 
@@ -55,6 +58,9 @@ python3 -m src.main sell btc 0.001
 
 # Vender 50 USDC
 python3 -m src.main sell usdc 50
+
+# Vender usando estrategia por profundidad (90% del volumen)
+python3 -m src.main sell btc 0.001 --strategy depth --depth 0.9
 
 # Cambiar intervalo de monitoreo a 60 segundos (default: 30)
 python3 -m src.main sell btc 0.001 --interval 60
@@ -93,11 +99,33 @@ python3 -m src.main --help
 python3 -m src.main buy --help
 ```
 
+## Estrategias de Precio
+
+El bot soporta estrategias para definir el precio límite:
+
+- **top** (default): mantiene la mejor posición (best bid/ask) con `best_bid + tick` o `best_ask - tick`.
+- **depth**: coloca la orden al precio donde se acumula al menos un % del volumen del libro.
+
+### Estrategia `depth`
+
+Se calcula **en volumen de crypto** (BTC/USDC):
+
+- **Compra (bid)**: acumula el volumen **desde precios bajos hacia arriba** hasta llegar al `%` objetivo.
+- **Venta (ask)**: acumula el volumen **desde precios altos hacia abajo** hasta llegar al `%` objetivo.
+
+Flags:
+
+```bash
+# Usar estrategia depth con 90% del volumen
+python3 -m src.main buy btc 100000 --strategy depth --depth 0.9
+python3 -m src.main sell btc 0.001 --strategy depth --depth 0.9
+```
+
 ## Cómo Funciona
 
 1. **Verificación de saldo**: Confirma que tienes suficiente CLP o crypto
 2. **Order book en tiempo real**: Se conecta por WebSocket y mantiene el best bid/ask (con fallback REST)
-3. **Cálculo de precio óptimo**: Coloca la orden a `best_bid + tick` para comprar o `best_ask - tick` para vender
+3. **Cálculo de precio**: Usa la estrategia configurada (`top` o `depth`)
 4. **Colocación de orden límite**: Crea una orden de compra (Bid) o venta (Ask) al precio calculado
 5. **Monitoreo continuo**: Reacciona a cambios en el book o cada `interval` segundos (configurable):
    - Si la orden se ejecutó completamente → termina con resumen

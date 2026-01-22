@@ -5,7 +5,7 @@ import signal
 import sys
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .api import BudaClient, BudaAPIError, InsufficientBalanceError
 from .utils import (
@@ -45,7 +45,9 @@ class TradingBot:
         client: BudaClient,
         currency: str,
         interval: int = 30,
-        dry_run: bool = False
+        dry_run: bool = False,
+        strategy: str = "top",
+        depth_ratio: Decimal = Decimal("0.9"),
     ):
         """
         Initialize the trading bot.
@@ -61,8 +63,15 @@ class TradingBot:
         self.market_id = f"{self.currency}-clp"
         self.interval = interval
         self.dry_run = dry_run
+        self.strategy = strategy
+        self.depth_ratio = Decimal(str(depth_ratio))
         self.min_amount = self.MIN_AMOUNTS.get(
             self.market_id, Decimal("0.00001"))
+
+        if self.strategy not in {"top", "depth"}:
+            raise BudaAPIError(f"Unknown strategy: {self.strategy}")
+        if not (Decimal("0") < self.depth_ratio <= Decimal("1")):
+            raise BudaAPIError("Depth ratio must be between 0 and 1")
 
         self._current_order_id: Optional[str] = None
         self._running = False
@@ -225,7 +234,8 @@ class TradingBot:
             Tuple of (best_bid, best_ask) prices.
         """
         if self._realtime:
-            if not self._realtime.book_state.is_stale(self.interval * 3):
+            max_age = max(self.interval * 3, 1.0)
+            if not self._realtime.book_state.is_stale(max_age):
                 best = self._realtime.book_state.get_best()
                 if best:
                     return best
@@ -236,22 +246,108 @@ class TradingBot:
                         f"Realtime book stale ({age:.1f}s). Falling back to REST.", "WARN"
                     )
 
-        order_book = self.client.get_order_book(self.market_id)
-
-        bids = order_book.get("bids", [])
-        asks = order_book.get("asks", [])
-        if self._realtime:
-            self._realtime.book_state.apply_snapshot(bids, asks)
-
+        bids, asks = self.get_order_book_levels()
         if not bids:
             raise BudaAPIError("No bids in order book")
         if not asks:
             raise BudaAPIError("No asks in order book")
 
-        best_bid, _ = parse_order_book_entry(bids[0])
-        best_ask, _ = parse_order_book_entry(asks[0])
+        best_bid = bids[0][0]
+        best_ask = asks[0][0]
 
         return best_bid, best_ask
+
+    def get_order_book_levels(self) -> Tuple[List[Tuple[Decimal, Decimal]], List[Tuple[Decimal, Decimal]]]:
+        """
+        Return order book levels as lists of (price, amount) tuples.
+
+        Bids are sorted descending (best first), asks ascending (best first).
+        """
+        if self._realtime:
+            max_age = max(self.interval * 3, 1.0)
+            if not self._realtime.book_state.is_stale(max_age):
+                bids_dict, asks_dict = self._realtime.book_state.get_snapshot()
+                if bids_dict and asks_dict:
+                    bids = sorted(bids_dict.items(), key=lambda x: x[0], reverse=True)
+                    asks = sorted(asks_dict.items(), key=lambda x: x[0])
+                    return bids, asks
+            age = self._realtime.book_state.age_seconds()
+            if age != float("inf"):
+                print_status(
+                    f"Realtime book stale ({age:.1f}s). Falling back to REST.", "WARN"
+                )
+
+        order_book = self.client.get_order_book(self.market_id)
+        bids_raw = order_book.get("bids", [])
+        asks_raw = order_book.get("asks", [])
+        if self._realtime:
+            self._realtime.book_state.apply_snapshot(bids_raw, asks_raw)
+
+        bids = [parse_order_book_entry(entry) for entry in bids_raw]
+        asks = [parse_order_book_entry(entry) for entry in asks_raw]
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
+        return bids, asks
+
+    def _strategy_label(self) -> str:
+        if self.strategy == "depth":
+            pct = (self.depth_ratio * Decimal("100")).quantize(Decimal("1"))
+            return f"depth {pct}%"
+        return "top"
+
+    def calculate_depth_price(
+        self,
+        side: str,
+        bids: List[Tuple[Decimal, Decimal]],
+        asks: List[Tuple[Decimal, Decimal]],
+    ) -> Decimal:
+        """
+        Calculate price based on cumulative depth ratio.
+
+        For buys, accumulate bids from low to high.
+        For sells, accumulate asks from high to low.
+        """
+        if side == "buy":
+            levels = bids
+            ordered = sorted(levels, key=lambda x: x[0])  # low -> high
+        else:
+            levels = asks
+            ordered = sorted(levels, key=lambda x: x[0], reverse=True)  # high -> low
+
+        if not ordered:
+            raise BudaAPIError("Order book side is empty")
+
+        total = sum((amount for _, amount in ordered), Decimal("0"))
+        if total <= 0:
+            raise BudaAPIError("Order book volume is zero")
+
+        target = total * self.depth_ratio
+        cumulative = Decimal("0")
+        for price, amount in ordered:
+            cumulative += amount
+            if cumulative >= target:
+                if side == "buy":
+                    return self._round_price_down(price)
+                return self._round_price_up(price)
+
+        price = ordered[-1][0]
+        if side == "buy":
+            return self._round_price_down(price)
+        return self._round_price_up(price)
+
+    def calculate_strategy_price(
+        self,
+        side: str,
+        bids: List[Tuple[Decimal, Decimal]],
+        asks: List[Tuple[Decimal, Decimal]],
+        best_bid: Decimal,
+        best_ask: Decimal,
+    ) -> Decimal:
+        if self.strategy == "depth":
+            return self.calculate_depth_price(side, bids, asks)
+        if side == "buy":
+            return self.calculate_optimal_price(best_bid, best_ask)
+        return self.calculate_optimal_sell_price(best_bid, best_ask)
 
     @staticmethod
     def _parse_order_state(order: dict) -> Tuple[str, Decimal, Decimal, Decimal]:
@@ -441,27 +537,42 @@ class TradingBot:
         self._last_action_ts = time.time()
         return order
 
-    def cancel_current_order(self) -> bool:
+    def cancel_current_order(self, order_id: Optional[str] = None) -> bool:
         """
         Cancel the current active order.
 
         Returns:
             True if canceled successfully, False otherwise.
         """
-        if not self._current_order_id:
+        target_id = order_id or self._current_order_id
+        if not target_id:
             return True
 
         if self.dry_run:
             print_status(
-                f"[DRY RUN] Would cancel order {self._current_order_id}", "INFO")
-            self._current_order_id = None
+                f"[DRY RUN] Would cancel order {target_id}", "INFO")
+            if target_id == self._current_order_id:
+                self._current_order_id = None
             return True
 
         try:
-            self.client.cancel_order(self._current_order_id)
-            print_status(f"Canceled order {self._current_order_id}", "OK")
-            self._current_order_id = None
-            return True
+            self.client.cancel_order(target_id)
+            print_status(f"Cancel requested for order {target_id}", "OK")
+
+            # Wait briefly for cancellation to be reflected before placing a new order.
+            for _ in range(10):
+                state, _, _, _ = self.get_order_state(target_id)
+                if state in ("canceled", "canceled_and_traded", "traded"):
+                    if target_id == self._current_order_id:
+                        self._current_order_id = None
+                    print_status(f"Order {target_id} canceled ({state}).", "OK")
+                    return True
+                time.sleep(0.2)
+
+            print_status(
+                f"Order {target_id} not confirmed canceled yet. Skipping reprice.", "WARN"
+            )
+            return False
         except BudaAPIError as e:
             print_status(f"Failed to cancel order: {e}", "ERROR")
             return False
@@ -644,28 +755,34 @@ class TradingBot:
 
             # Step 3: Get initial prices
             print_status("Fetching order book...", "INFO")
-            best_bid, best_ask = self.get_best_prices()
+            bids, asks = self.get_order_book_levels()
+            if not bids or not asks:
+                raise BudaAPIError("Order book empty")
+            best_bid, best_ask = bids[0][0], asks[0][0]
             print_status(f"Best bid: {format_clp(best_bid)}", "INFO")
             print_status(f"Best ask: {format_clp(best_ask)}", "INFO")
             print_status(f"Spread: {format_clp(best_ask - best_bid)}", "INFO")
+            print_status(f"Strategy: {self._strategy_label()}", "INFO")
             print()
 
             # Step 4: Calculate optimal price and amount
-            optimal_price = self.calculate_optimal_price(best_bid, best_ask)
-            amount = self.calculate_crypto_amount(clp_amount, optimal_price)
+            target_price = self.calculate_strategy_price(
+                "buy", bids, asks, best_bid, best_ask
+            )
+            amount = self.calculate_crypto_amount(clp_amount, target_price)
 
-            print_status(f"Optimal price: {format_clp(optimal_price)}", "INFO")
+            print_status(f"Target price: {format_clp(target_price)}", "INFO")
             print_status(
                 f"Order amount: {format_crypto(amount, self.currency)}", "INFO")
             print_status(
-                f"Estimated total: {format_clp(amount * optimal_price)}", "INFO")
+                f"Estimated total: {format_clp(amount * target_price)}", "INFO")
             print()
 
             # Step 5: Place initial order
             print_status("Placing initial order...", "INFO")
-            order = self.place_order(amount, optimal_price)
+            order = self.place_order(amount, target_price)
             order_id = order.get("id")
-            current_price = optimal_price
+            current_price = target_price
             print_status(f"Order placed! ID: {order_id}", "OK")
             print_order_info(order, self.currency)
             print()
@@ -739,16 +856,20 @@ class TradingBot:
                             return
 
                         # Place new order with remaining amount
-                        best_bid, best_ask = self.get_best_prices()
-                        optimal_price = self.calculate_optimal_price(
-                            best_bid, best_ask)
+                        bids, asks = self.get_order_book_levels()
+                        if not bids or not asks:
+                            raise BudaAPIError("Order book empty")
+                        best_bid, best_ask = bids[0][0], asks[0][0]
+                        target_price = self.calculate_strategy_price(
+                            "buy", bids, asks, best_bid, best_ask
+                        )
                         amount = self.calculate_crypto_amount(
-                            remaining_clp, optimal_price)
+                            remaining_clp, target_price)
                         print_status(
                             f"Placing new order with remaining {format_clp(remaining_clp)}", "INFO")
-                        order = self.place_order(amount, optimal_price)
+                        order = self.place_order(amount, target_price)
                         order_id = order.get("id")
-                        current_price = optimal_price
+                        current_price = target_price
                         last_traded_crypto = Decimal("0")
                         last_traded_clp = Decimal("0")
                         print_status(f"New order placed! ID: {order_id}", "OK")
@@ -761,26 +882,45 @@ class TradingBot:
 
                     # Check if we're still best bid
                     print_status("Checking position...", "INFO")
-                    best_bid, best_ask = self.get_best_prices()
+                    bids, asks = self.get_order_book_levels()
+                    if not bids or not asks:
+                        raise BudaAPIError("Order book empty")
+                    best_bid, best_ask = bids[0][0], asks[0][0]
+                    target_price = self.calculate_strategy_price(
+                        "buy", bids, asks, best_bid, best_ask
+                    )
 
-                    if self.is_best_bid(current_price):
+                    if self.strategy == "top" and current_price >= best_bid:
                         print_status(
                             f"Still best bid at {format_clp(current_price)} "
                             f"(market: {format_clp(best_bid)})",
+                            "OK"
+                        )
+                    elif self.strategy != "top" and current_price == target_price:
+                        print_status(
+                            f"Still at target price {format_clp(current_price)} "
+                            f"(strategy: {self._strategy_label()})",
                             "OK"
                         )
                     else:
                         if time.time() - self._last_action_ts < self._min_action_interval:
                             continue
 
-                        print_status(
-                            f"Outbid! Our price: {format_clp(current_price)}, "
-                            f"Best bid: {format_clp(best_bid)}",
-                            "WARN"
-                        )
+                        if self.strategy == "top":
+                            print_status(
+                                f"Outbid! Our price: {format_clp(current_price)}, "
+                                f"Best bid: {format_clp(best_bid)}",
+                                "WARN"
+                            )
+                        else:
+                            print_status(
+                                f"Target moved. Our price: {format_clp(current_price)}, "
+                                f"New target: {format_clp(target_price)}",
+                                "WARN"
+                            )
 
                         # Cancel current order - may result in partial fill
-                        if not self.cancel_current_order():
+                        if not self.cancel_current_order(order_id):
                             print_status(
                                 "Could not cancel order. Retrying...", "WARN")
                             continue
@@ -806,20 +946,21 @@ class TradingBot:
                             return
 
                         # Recalculate price and amount with remaining CLP
-                        optimal_price = self.calculate_optimal_price(
-                            best_bid, best_ask)
+                        target_price = self.calculate_strategy_price(
+                            "buy", bids, asks, best_bid, best_ask
+                        )
                         amount = self.calculate_crypto_amount(
-                            remaining_clp, optimal_price)
+                            remaining_clp, target_price)
 
                         print_status(
-                            f"New optimal price: {format_clp(optimal_price)}", "INFO")
+                            f"New target price: {format_clp(target_price)}", "INFO")
                         print_status(
                             f"Order amount: {format_crypto(amount, self.currency)} ({format_clp(remaining_clp)})", "INFO")
 
                         # Place new order
-                        order = self.place_order(amount, optimal_price)
+                        order = self.place_order(amount, target_price)
                         order_id = order.get("id")
-                        current_price = optimal_price
+                        current_price = target_price
                         last_traded_crypto = Decimal("0")
                         last_traded_clp = Decimal("0")
                         print_status(f"New order placed! ID: {order_id}", "OK")
@@ -878,14 +1019,20 @@ class TradingBot:
 
             # Step 3: Get initial prices
             print_status("Fetching order book...", "INFO")
-            best_bid, best_ask = self.get_best_prices()
+            bids, asks = self.get_order_book_levels()
+            if not bids or not asks:
+                raise BudaAPIError("Order book empty")
+            best_bid, best_ask = bids[0][0], asks[0][0]
             print_status(f"Best bid: {format_clp(best_bid)}", "INFO")
             print_status(f"Best ask: {format_clp(best_ask)}", "INFO")
             print_status(f"Spread: {format_clp(best_ask - best_bid)}", "INFO")
+            print_status(f"Strategy: {self._strategy_label()}", "INFO")
             print()
 
             # Step 4: Calculate optimal price and amount
-            optimal_price = self.calculate_optimal_sell_price(best_bid, best_ask)
+            target_price = self.calculate_strategy_price(
+                "sell", bids, asks, best_bid, best_ask
+            )
             amount = self.quantize_crypto_amount(crypto_amount)
 
             if amount < self.min_amount:
@@ -894,18 +1041,18 @@ class TradingBot:
                     f"minimum {format_crypto(self.min_amount, self.currency)}"
                 )
 
-            print_status(f"Optimal price: {format_clp(optimal_price)}", "INFO")
+            print_status(f"Target price: {format_clp(target_price)}", "INFO")
             print_status(
                 f"Order amount: {format_crypto(amount, self.currency)}", "INFO")
             print_status(
-                f"Estimated total: {format_clp(amount * optimal_price)}", "INFO")
+                f"Estimated total: {format_clp(amount * target_price)}", "INFO")
             print()
 
             # Step 5: Place initial order
             print_status("Placing initial order...", "INFO")
-            order = self.place_order(amount, optimal_price, order_type="Ask")
+            order = self.place_order(amount, target_price, order_type="Ask")
             order_id = order.get("id")
-            current_price = optimal_price
+            current_price = target_price
             print_status(f"Order placed! ID: {order_id}", "OK")
             print_order_info(order, self.currency)
             print()
@@ -980,16 +1127,20 @@ class TradingBot:
                             self.print_sell_final_summary()
                             return
 
-                        best_bid, best_ask = self.get_best_prices()
-                        optimal_price = self.calculate_optimal_sell_price(
-                            best_bid, best_ask)
+                        bids, asks = self.get_order_book_levels()
+                        if not bids or not asks:
+                            raise BudaAPIError("Order book empty")
+                        best_bid, best_ask = bids[0][0], asks[0][0]
+                        target_price = self.calculate_strategy_price(
+                            "sell", bids, asks, best_bid, best_ask
+                        )
                         amount = self.quantize_crypto_amount(remaining_crypto)
                         print_status(
                             f"Placing new order with remaining {format_crypto(remaining_crypto, self.currency)}", "INFO")
                         order = self.place_order(
-                            amount, optimal_price, order_type="Ask")
+                            amount, target_price, order_type="Ask")
                         order_id = order.get("id")
-                        current_price = optimal_price
+                        current_price = target_price
                         last_traded_crypto = Decimal("0")
                         last_traded_clp = Decimal("0")
                         print_status(f"New order placed! ID: {order_id}", "OK")
@@ -1002,25 +1153,44 @@ class TradingBot:
 
                     # Check if we're still best ask
                     print_status("Checking position...", "INFO")
-                    best_bid, best_ask = self.get_best_prices()
+                    bids, asks = self.get_order_book_levels()
+                    if not bids or not asks:
+                        raise BudaAPIError("Order book empty")
+                    best_bid, best_ask = bids[0][0], asks[0][0]
+                    target_price = self.calculate_strategy_price(
+                        "sell", bids, asks, best_bid, best_ask
+                    )
 
-                    if self.is_best_ask(current_price):
+                    if self.strategy == "top" and current_price <= best_ask:
                         print_status(
                             f"Still best ask at {format_clp(current_price)} "
                             f"(market: {format_clp(best_ask)})",
+                            "OK"
+                        )
+                    elif self.strategy != "top" and current_price == target_price:
+                        print_status(
+                            f"Still at target price {format_clp(current_price)} "
+                            f"(strategy: {self._strategy_label()})",
                             "OK"
                         )
                     else:
                         if time.time() - self._last_action_ts < self._min_action_interval:
                             continue
 
-                        print_status(
-                            f"Outasked! Our price: {format_clp(current_price)}, "
-                            f"Best ask: {format_clp(best_ask)}",
-                            "WARN"
-                        )
+                        if self.strategy == "top":
+                            print_status(
+                                f"Outasked! Our price: {format_clp(current_price)}, "
+                                f"Best ask: {format_clp(best_ask)}",
+                                "WARN"
+                            )
+                        else:
+                            print_status(
+                                f"Target moved. Our price: {format_clp(current_price)}, "
+                                f"New target: {format_clp(target_price)}",
+                                "WARN"
+                            )
 
-                        if not self.cancel_current_order():
+                        if not self.cancel_current_order(order_id):
                             print_status(
                                 "Could not cancel order. Retrying...", "WARN")
                             continue
@@ -1043,19 +1213,20 @@ class TradingBot:
                             self.print_sell_final_summary()
                             return
 
-                        optimal_price = self.calculate_optimal_sell_price(
-                            best_bid, best_ask)
+                        target_price = self.calculate_strategy_price(
+                            "sell", bids, asks, best_bid, best_ask
+                        )
                         amount = self.quantize_crypto_amount(remaining_crypto)
 
                         print_status(
-                            f"New optimal price: {format_clp(optimal_price)}", "INFO")
+                            f"New target price: {format_clp(target_price)}", "INFO")
                         print_status(
                             f"Order amount: {format_crypto(amount, self.currency)}", "INFO")
 
                         order = self.place_order(
-                            amount, optimal_price, order_type="Ask")
+                            amount, target_price, order_type="Ask")
                         order_id = order.get("id")
-                        current_price = optimal_price
+                        current_price = target_price
                         last_traded_crypto = Decimal("0")
                         last_traded_clp = Decimal("0")
                         print_status(f"New order placed! ID: {order_id}", "OK")
