@@ -48,6 +48,7 @@ class TradingBot:
         dry_run: bool = False,
         strategy: str = "top",
         depth_ratio: Decimal = Decimal("0.9"),
+        register_signals: bool = True,
     ):
         """
         Initialize the trading bot.
@@ -94,11 +95,12 @@ class TradingBot:
         self._active_side: Optional[str] = None
 
         # Setup signal handlers for clean exit
-        signal.signal(signal.SIGINT, self._handle_interrupt)
-        signal.signal(signal.SIGTERM, self._handle_interrupt)
+        if register_signals:
+            signal.signal(signal.SIGINT, self._handle_interrupt)
+            signal.signal(signal.SIGTERM, self._handle_interrupt)
 
-    def _handle_interrupt(self, signum, frame):
-        """Handle interrupt signals for clean shutdown."""
+    def cleanup(self):
+        """Clean up active orders and show final summary. Does not exit."""
         print("\n")
         print_status("Interrupt received. Cleaning up...", "WARN")
         self._running = False
@@ -135,6 +137,9 @@ class TradingBot:
         elif self._total_clp_target > 0:
             self.print_final_summary()
 
+    def _handle_interrupt(self, signum, frame):
+        """Handle interrupt signals for clean shutdown."""
+        self.cleanup()
         sys.exit(0)
 
     def _start_realtime(self) -> None:

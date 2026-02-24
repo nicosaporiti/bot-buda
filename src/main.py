@@ -280,8 +280,8 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.command:
-        parser.print_help()
-        return 0
+        from .tui import launch_tui
+        return launch_tui()
 
     # Load configuration
     try:

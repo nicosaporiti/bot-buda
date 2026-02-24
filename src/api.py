@@ -296,6 +296,23 @@ class BudaClient:
         response = self._make_request("PUT", f"/orders/{order_id}", body=body)
         return response.get("order", response)
 
+    def get_ticker(self, market_id: str) -> dict:
+        """
+        Get the ticker for a specific market.
+
+        Args:
+            market_id: Market identifier (e.g., 'btc-clp', 'usdc-clp').
+
+        Returns:
+            Ticker information including last_price.
+        """
+        response = self._make_request(
+            "GET",
+            f"/markets/{market_id.lower()}/ticker",
+            authenticated=False
+        )
+        return response.get("ticker", response)
+
     def get_my_orders(self, market_id: str, state: str = None) -> list:
         """
         Get list of own orders for a market.
