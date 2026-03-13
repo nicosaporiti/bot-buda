@@ -28,22 +28,20 @@ def format_clp(amount: float | str | Decimal) -> str:
     return f"{sign}${formatted_int},{decimals} CLP"
 
 
-def format_crypto(amount: float | str | Decimal, currency: str) -> str:
+def format_crypto(amount: float | str | Decimal, currency: str, decimals: int = 8) -> str:
     """
     Format a cryptocurrency amount.
 
     Args:
         amount: Amount of cryptocurrency.
         currency: Currency code (e.g., 'BTC', 'USDC').
+        decimals: Number of decimal places (default: 8).
 
     Returns:
         Formatted string (e.g., "0.00123456 BTC").
     """
     amount = Decimal(str(amount))
-    if currency.upper() == "BTC":
-        formatted = f"{amount:.8f}"
-    else:
-        formatted = f"{amount:.6f}"
+    formatted = f"{amount:.{decimals}f}"
     return f"{formatted} {currency.upper()}"
 
 
@@ -62,7 +60,7 @@ def parse_order_book_entry(entry: list) -> Tuple[Decimal, Decimal]:
     return price, amount
 
 
-def calculate_amount_for_clp(clp_amount: Decimal, price: Decimal, min_amount: Decimal) -> Decimal:
+def calculate_amount_for_clp(clp_amount: Decimal, price: Decimal, min_amount: Decimal, decimals: int = 8) -> Decimal:
     """
     Calculate how much crypto can be bought with a given CLP amount.
 
@@ -70,14 +68,15 @@ def calculate_amount_for_clp(clp_amount: Decimal, price: Decimal, min_amount: De
         clp_amount: Amount of CLP to spend.
         price: Price per unit of crypto in CLP.
         min_amount: Minimum order amount for the market.
+        decimals: Number of decimal places for the base currency.
 
     Returns:
         Amount of crypto to buy, rounded down to appropriate precision.
     """
     raw_amount = clp_amount / price
 
-    # Round down to 8 decimal places (BTC precision)
-    amount = raw_amount.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+    precision = Decimal(10) ** -decimals
+    amount = raw_amount.quantize(precision, rounding=ROUND_DOWN)
 
     # Ensure amount is at least the minimum
     if amount < min_amount:

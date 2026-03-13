@@ -200,6 +200,20 @@ class BudaClient:
         response = self._make_request("GET", "/me")
         return response.get("user", response)
 
+    def get_markets(self) -> list[dict]:
+        """
+        Get all available markets.
+
+        Returns:
+            List of market dictionaries.
+        """
+        response = self._make_request("GET", "/markets", authenticated=False)
+        if isinstance(response, dict) and isinstance(response.get("markets"), list):
+            return response["markets"]
+        if isinstance(response, list):
+            return response
+        return []
+
     def get_order_book(self, market_id: str) -> dict:
         """
         Get the order book for a specific market.

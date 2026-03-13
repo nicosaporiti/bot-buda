@@ -24,16 +24,14 @@ def prompt_main_menu() -> str:
     return result
 
 
-def _prompt_currency() -> str | None:
+def _prompt_currency(currencies: list[str]) -> str | None:
     """Prompt for currency selection. Returns None if back."""
+    choices = [{"name": c.upper(), "value": c} for c in currencies]
+    choices.append(Separator())
+    choices.append({"name": "<- Volver", "value": None})
     result = inquirer.select(
         message="Moneda:",
-        choices=[
-            {"name": "BTC", "value": "btc"},
-            {"name": "USDC", "value": "usdc"},
-            Separator(),
-            {"name": "<- Volver", "value": None},
-        ],
+        choices=choices,
     ).execute()
     return result
 
@@ -116,28 +114,52 @@ def _validate_depth_ratio(val: str) -> bool:
         return False
 
 
-def prompt_buy_params() -> dict | None:
+def _quote_amount_validator(quote_decimals: int):
+    """Return a validator for quote-currency amounts.
+
+    Integer-only when quote_decimals == 0, decimal otherwise.
+    """
+    if quote_decimals == 0:
+        return _validate_clp_amount
+    return _validate_crypto_amount
+
+
+def prompt_buy_params(
+    currencies: list[str],
+    quote_currency: str = "clp",
+    quote_decimals: int = 0,
+    usd_unit_available: bool = True,
+) -> dict | None:
     """Run the buy flow prompts. Returns params dict or None if cancelled."""
-    currency = _prompt_currency()
+    currency = _prompt_currency(currencies)
     if currency is None:
         return None
 
-    # Ask unit for amount
+    qc_label = quote_currency.upper()
+    validate_quote = _quote_amount_validator(quote_decimals)
+    invalid_msg = (
+        "Debe ser un numero entero positivo"
+        if quote_decimals == 0
+        else "Debe ser un numero positivo"
+    )
+
+    # Build unit choices
+    unit_choices = [{"name": qc_label, "value": "clp"}]
+    if usd_unit_available:
+        unit_choices.append({"name": "USD", "value": "usd"})
+    unit_choices.append({"name": currency.upper(), "value": "crypto"})
+
     unit = inquirer.select(
         message="Ingresar monto en:",
-        choices=[
-            {"name": "CLP", "value": "clp"},
-            {"name": "USD", "value": "usd"},
-            {"name": currency.upper(), "value": "crypto"},
-        ],
+        choices=unit_choices,
         default="clp",
     ).execute()
 
     if unit == "clp":
         amount_str = inquirer.text(
-            message="Monto en CLP:",
-            validate=_validate_clp_amount,
-            invalid_message="Debe ser un numero entero positivo",
+            message=f"Monto en {qc_label}:",
+            validate=validate_quote,
+            invalid_message=invalid_msg,
         ).execute()
         raw_amount = Decimal(amount_str)
     elif unit == "usd":
@@ -164,7 +186,7 @@ def prompt_buy_params() -> dict | None:
         "currency": currency,
         "amount_unit": unit,
         "raw_amount": raw_amount,
-        "amount": int(amount_str) if unit == "clp" else raw_amount,
+        "amount": raw_amount,
         "strategy": strategy,
         "depth_ratio": depth_ratio,
         "interval": interval,
@@ -172,20 +194,34 @@ def prompt_buy_params() -> dict | None:
     }
 
 
-def prompt_sell_params() -> dict | None:
+def prompt_sell_params(
+    currencies: list[str],
+    quote_currency: str = "clp",
+    quote_decimals: int = 0,
+    usd_unit_available: bool = True,
+) -> dict | None:
     """Run the sell flow prompts. Returns params dict or None if cancelled."""
-    currency = _prompt_currency()
+    currency = _prompt_currency(currencies)
     if currency is None:
         return None
 
-    # Ask unit for amount
+    qc_label = quote_currency.upper()
+    validate_quote = _quote_amount_validator(quote_decimals)
+    invalid_msg = (
+        "Debe ser un numero entero positivo"
+        if quote_decimals == 0
+        else "Debe ser un numero positivo"
+    )
+
+    # Build unit choices
+    unit_choices = [{"name": currency.upper(), "value": "crypto"}]
+    if usd_unit_available:
+        unit_choices.append({"name": "USD", "value": "usd"})
+    unit_choices.append({"name": qc_label, "value": "clp"})
+
     unit = inquirer.select(
         message="Ingresar cantidad en:",
-        choices=[
-            {"name": currency.upper(), "value": "crypto"},
-            {"name": "USD", "value": "usd"},
-            {"name": "CLP", "value": "clp"},
-        ],
+        choices=unit_choices,
         default="crypto",
     ).execute()
 
@@ -205,9 +241,9 @@ def prompt_sell_params() -> dict | None:
         raw_amount = Decimal(amount_str)
     else:
         amount_str = inquirer.text(
-            message="Monto en CLP:",
-            validate=_validate_clp_amount,
-            invalid_message="Debe ser un numero entero positivo",
+            message=f"Monto en {qc_label}:",
+            validate=validate_quote,
+            invalid_message=invalid_msg,
         ).execute()
         raw_amount = Decimal(amount_str)
 
@@ -244,15 +280,13 @@ def prompt_balance_currency() -> str | None:
     return result
 
 
-def prompt_orderbook_market() -> str | None:
+def prompt_orderbook_market(market_ids: list[str]) -> str | None:
     """Prompt for order book market. Returns market string or None."""
+    choices = [{"name": mid.upper(), "value": mid} for mid in market_ids]
+    choices.append(Separator())
+    choices.append({"name": "<- Volver", "value": None})
     result = inquirer.select(
         message="Mercado:",
-        choices=[
-            {"name": "BTC-CLP", "value": "btc-clp"},
-            {"name": "USDC-CLP", "value": "usdc-clp"},
-            Separator(),
-            {"name": "<- Volver", "value": None},
-        ],
+        choices=choices,
     ).execute()
     return result

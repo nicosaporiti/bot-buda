@@ -7,6 +7,7 @@ from rich.console import Console
 from ..api import BudaClient, BudaAPIError, AuthenticationError
 from ..bot import TradingBot
 from ..config import Config, ConfigError
+from ..market import MarketRegistry, KNOWN_DECIMALS
 from ..utils import format_clp, format_crypto
 from .display import (
     print_header,
@@ -38,7 +39,20 @@ def launch_tui() -> int:
         return 1
 
     client = BudaClient(config)
+
+    # Build market registry
+    try:
+        registry = MarketRegistry(client, config.quote_currency)
+    except Exception as e:
+        console.print(f"[red]Error cargando mercados:[/red] {e}")
+        return 1
+
     print_header(console)
+
+    # Check if USDC market exists (for USD unit option)
+    usdc_market_id = f"usdc-{registry.quote_currency}"
+    usd_unit_available = registry.has_market(usdc_market_id)
+    quote_decimals = KNOWN_DECIMALS.get(registry.quote_currency, 0)
 
     while True:
         try:
@@ -53,13 +67,13 @@ def launch_tui() -> int:
 
         try:
             if action == "buy":
-                _handle_buy(console, client)
+                _handle_buy(console, client, registry, usd_unit_available, quote_decimals)
             elif action == "sell":
-                _handle_sell(console, client)
+                _handle_sell(console, client, registry, usd_unit_available, quote_decimals)
             elif action == "balance":
                 _handle_balance(console, client)
             elif action == "orderbook":
-                _handle_orderbook(console, client)
+                _handle_orderbook(console, client, registry)
         except AuthenticationError:
             console.print("[red]Error de autenticacion. Verifica tu API key y secret en .env[/red]")
         except KeyboardInterrupt:
@@ -67,8 +81,8 @@ def launch_tui() -> int:
             continue
 
 
-def _resolve_amount(console: Console, client: BudaClient, params: dict) -> bool:
-    """Resolve amount to native unit (CLP for buy, crypto for sell).
+def _resolve_amount(console: Console, client: BudaClient, registry: MarketRegistry, params: dict) -> bool:
+    """Resolve amount to native unit (quote currency for buy, crypto for sell).
 
     Modifies params in-place, setting 'amount' to the converted value and
     'converted_display' with a human-readable string of the conversion.
@@ -79,7 +93,12 @@ def _resolve_amount(console: Console, client: BudaClient, params: dict) -> bool:
     unit = params.get("amount_unit", "clp" if side == "buy" else "crypto")
     raw = params["raw_amount"]
     currency = params["currency"]
-    market_id = f"{currency}-clp"
+    market_config = registry.get_by_currency(currency)
+    market_id = market_config.market_id
+    base_decimals = market_config.base_decimals
+    quote_decimals = market_config.quote_decimals
+    crypto_precision = Decimal(10) ** -base_decimals
+    quote_precision = Decimal(10) ** -quote_decimals
 
     # Already in native unit — no conversion needed
     if (side == "buy" and unit == "clp") or (side == "sell" and unit == "crypto"):
@@ -89,45 +108,46 @@ def _resolve_amount(console: Console, client: BudaClient, params: dict) -> bool:
         console.print("[dim]Consultando precio...[/dim]")
 
         if unit == "usd":
-            usdc_ticker = client.get_ticker("usdc-clp")
+            usdc_market_id = f"usdc-{registry.quote_currency}"
+            usdc_ticker = client.get_ticker(usdc_market_id)
             usdc_price = Decimal(str(usdc_ticker["last_price"][0]))
             console.print(f"[dim]  1 USD ≈ {format_clp(usdc_price)}[/dim]")
 
             if side == "buy":
-                # USD → CLP
-                clp_amount = (raw * usdc_price).quantize(Decimal("1"), rounding=ROUND_DOWN)
-                params["amount"] = int(clp_amount)
-                params["converted_display"] = f"{raw} USD (~{format_clp(clp_amount)})"
-                console.print(f"[dim]  Monto equivalente: ~{format_clp(clp_amount)}[/dim]")
+                # USD → quote currency
+                quote_amount = (raw * usdc_price).quantize(quote_precision, rounding=ROUND_DOWN)
+                params["amount"] = quote_amount
+                params["converted_display"] = f"{raw} USD (~{format_clp(quote_amount)})"
+                console.print(f"[dim]  Monto equivalente: ~{format_clp(quote_amount)}[/dim]")
             else:
-                # USD → crypto: first USD→CLP, then CLP→crypto
+                # USD → crypto: first USD→quote, then quote→crypto
                 crypto_ticker = client.get_ticker(market_id)
                 crypto_price = Decimal(str(crypto_ticker["last_price"][0]))
-                clp_amount = raw * usdc_price
-                crypto_amount = (clp_amount / crypto_price).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+                quote_amount = raw * usdc_price
+                crypto_amount = (quote_amount / crypto_price).quantize(crypto_precision, rounding=ROUND_DOWN)
                 params["amount"] = str(crypto_amount)
-                params["converted_display"] = f"{raw} USD (~{format_crypto(crypto_amount, currency)})"
-                console.print(f"[dim]  Cantidad equivalente: ~{format_crypto(crypto_amount, currency)}[/dim]")
+                params["converted_display"] = f"{raw} USD (~{format_crypto(crypto_amount, currency, base_decimals)})"
+                console.print(f"[dim]  Cantidad equivalente: ~{format_crypto(crypto_amount, currency, base_decimals)}[/dim]")
 
         elif unit == "crypto":
-            # Buy with crypto amount → CLP
+            # Buy with crypto amount → quote currency
             crypto_ticker = client.get_ticker(market_id)
             crypto_price = Decimal(str(crypto_ticker["last_price"][0]))
             console.print(f"[dim]  1 {currency.upper()} ≈ {format_clp(crypto_price)}[/dim]")
-            clp_amount = (raw * crypto_price).quantize(Decimal("1"), rounding=ROUND_DOWN)
-            params["amount"] = int(clp_amount)
-            params["converted_display"] = f"{format_crypto(raw, currency)} (~{format_clp(clp_amount)})"
-            console.print(f"[dim]  Monto equivalente: ~{format_clp(clp_amount)}[/dim]")
+            quote_amount = (raw * crypto_price).quantize(quote_precision, rounding=ROUND_DOWN)
+            params["amount"] = quote_amount
+            params["converted_display"] = f"{format_crypto(raw, currency, base_decimals)} (~{format_clp(quote_amount)})"
+            console.print(f"[dim]  Monto equivalente: ~{format_clp(quote_amount)}[/dim]")
 
         elif unit == "clp":
-            # Sell with CLP amount → crypto
+            # Sell with quote currency amount → crypto
             crypto_ticker = client.get_ticker(market_id)
             crypto_price = Decimal(str(crypto_ticker["last_price"][0]))
             console.print(f"[dim]  1 {currency.upper()} ≈ {format_clp(crypto_price)}[/dim]")
-            crypto_amount = (raw / crypto_price).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+            crypto_amount = (raw / crypto_price).quantize(crypto_precision, rounding=ROUND_DOWN)
             params["amount"] = str(crypto_amount)
-            params["converted_display"] = f"{format_clp(raw)} (~{format_crypto(crypto_amount, currency)})"
-            console.print(f"[dim]  Cantidad equivalente: ~{format_crypto(crypto_amount, currency)}[/dim]")
+            params["converted_display"] = f"{format_clp(raw)} (~{format_crypto(crypto_amount, currency, base_decimals)})"
+            console.print(f"[dim]  Cantidad equivalente: ~{format_crypto(crypto_amount, currency, base_decimals)}[/dim]")
 
         console.print()
         return True
@@ -137,10 +157,15 @@ def _resolve_amount(console: Console, client: BudaClient, params: dict) -> bool:
         return False
 
 
-def _handle_buy(console: Console, client: BudaClient) -> None:
+def _handle_buy(console: Console, client: BudaClient, registry: MarketRegistry, usd_unit_available: bool, quote_decimals: int = 0) -> None:
     """Handle the buy flow."""
     try:
-        params = prompt_buy_params()
+        params = prompt_buy_params(
+            registry.currencies(),
+            quote_currency=registry.quote_currency,
+            quote_decimals=quote_decimals,
+            usd_unit_available=usd_unit_available,
+        )
     except KeyboardInterrupt:
         console.print()
         return
@@ -148,7 +173,7 @@ def _handle_buy(console: Console, client: BudaClient) -> None:
     if params is None:
         return
 
-    if not _resolve_amount(console, client, params):
+    if not _resolve_amount(console, client, registry, params):
         return
 
     print_order_summary(console, params)
@@ -161,13 +186,18 @@ def _handle_buy(console: Console, client: BudaClient) -> None:
         console.print()
         return
 
-    _run_bot(console, client, params)
+    _run_bot(console, client, registry, params)
 
 
-def _handle_sell(console: Console, client: BudaClient) -> None:
+def _handle_sell(console: Console, client: BudaClient, registry: MarketRegistry, usd_unit_available: bool, quote_decimals: int = 0) -> None:
     """Handle the sell flow."""
     try:
-        params = prompt_sell_params()
+        params = prompt_sell_params(
+            registry.currencies(),
+            quote_currency=registry.quote_currency,
+            quote_decimals=quote_decimals,
+            usd_unit_available=usd_unit_available,
+        )
     except KeyboardInterrupt:
         console.print()
         return
@@ -175,7 +205,7 @@ def _handle_sell(console: Console, client: BudaClient) -> None:
     if params is None:
         return
 
-    if not _resolve_amount(console, client, params):
+    if not _resolve_amount(console, client, registry, params):
         return
 
     print_order_summary(console, params)
@@ -188,14 +218,15 @@ def _handle_sell(console: Console, client: BudaClient) -> None:
         console.print()
         return
 
-    _run_bot(console, client, params)
+    _run_bot(console, client, registry, params)
 
 
-def _run_bot(console: Console, client: BudaClient, params: dict) -> None:
+def _run_bot(console: Console, client: BudaClient, registry: MarketRegistry, params: dict) -> None:
     """Create and run the trading bot with the given params."""
+    market_config = registry.get_by_currency(params["currency"])
     bot = TradingBot(
         client=client,
-        currency=params["currency"],
+        market_config=market_config,
         interval=params["interval"],
         dry_run=params["dry_run"],
         strategy=params["strategy"],
@@ -242,10 +273,10 @@ def _handle_balance(console: Console, client: BudaClient) -> None:
         console.print(f"[red]Error: {e}[/red]\n")
 
 
-def _handle_orderbook(console: Console, client: BudaClient) -> None:
+def _handle_orderbook(console: Console, client: BudaClient, registry: MarketRegistry) -> None:
     """Handle the order book view."""
     try:
-        market = prompt_orderbook_market()
+        market = prompt_orderbook_market(registry.market_ids())
     except KeyboardInterrupt:
         console.print()
         return

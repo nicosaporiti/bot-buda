@@ -8,6 +8,7 @@ from decimal import Decimal
 from .api import BudaClient, AuthenticationError, BudaAPIError
 from .bot import TradingBot
 from .config import Config, ConfigError
+from .market import MarketRegistry
 from .utils import format_clp, print_status
 
 
@@ -36,13 +37,12 @@ Examples:
     buy_parser.add_argument(
         "currency",
         type=str,
-        choices=["btc", "usdc", "BTC", "USDC"],
-        help="Currency to buy (btc or usdc)"
+        help="Currency to buy (e.g. btc, usdc, eth)"
     )
     buy_parser.add_argument(
         "amount",
-        type=int,
-        help="Amount of CLP to spend"
+        type=str,
+        help="Amount of quote currency to spend"
     )
     buy_parser.add_argument(
         "--interval",
@@ -77,8 +77,7 @@ Examples:
     sell_parser.add_argument(
         "currency",
         type=str,
-        choices=["btc", "usdc", "BTC", "USDC"],
-        help="Currency to sell (btc or usdc)"
+        help="Currency to sell (e.g. btc, usdc, eth)"
     )
     sell_parser.add_argument(
         "amount",
@@ -129,18 +128,32 @@ Examples:
         "market",
         type=str,
         nargs="?",
-        default="btc-clp",
-        help="Market to show (default: btc-clp)"
+        default=None,
+        help="Market to show (e.g. btc-clp)"
     )
 
     return parser
 
 
-def cmd_buy(args, client: BudaClient) -> int:
+def cmd_buy(args, client: BudaClient, registry: MarketRegistry) -> int:
     """Execute the buy command."""
     currency = args.currency.lower()
-    clp_amount = Decimal(args.amount)
     depth_ratio = Decimal(str(args.depth))
+
+    try:
+        clp_amount = Decimal(args.amount)
+    except Exception:
+        print_status(f"Invalid amount: {args.amount}", "ERROR")
+        return 1
+
+    # Validate currency against registry
+    available = registry.currencies()
+    if currency not in available:
+        print_status(
+            f"Currency '{currency}' not available. Options: {', '.join(available)}",
+            "ERROR",
+        )
+        return 1
 
     if clp_amount <= 0:
         print_status("Amount must be positive", "ERROR")
@@ -153,9 +166,10 @@ def cmd_buy(args, client: BudaClient) -> int:
     print_status(f"=" * 40, "INFO")
     print()
 
+    market_config = registry.get_by_currency(currency)
     bot = TradingBot(
         client=client,
-        currency=currency,
+        market_config=market_config,
         interval=args.interval,
         dry_run=args.dry_run,
         strategy=args.strategy,
@@ -170,11 +184,20 @@ def cmd_buy(args, client: BudaClient) -> int:
         return 1
 
 
-def cmd_sell(args, client: BudaClient) -> int:
+def cmd_sell(args, client: BudaClient, registry: MarketRegistry) -> int:
     """Execute the sell command."""
     currency = args.currency.lower()
     crypto_amount = Decimal(str(args.amount))
     depth_ratio = Decimal(str(args.depth))
+
+    # Validate currency against registry
+    available = registry.currencies()
+    if currency not in available:
+        print_status(
+            f"Currency '{currency}' not available. Options: {', '.join(available)}",
+            "ERROR",
+        )
+        return 1
 
     if crypto_amount <= 0:
         print_status("Amount must be positive", "ERROR")
@@ -187,9 +210,10 @@ def cmd_sell(args, client: BudaClient) -> int:
     print_status(f"=" * 40, "INFO")
     print()
 
+    market_config = registry.get_by_currency(currency)
     bot = TradingBot(
         client=client,
-        currency=currency,
+        market_config=market_config,
         interval=args.interval,
         dry_run=args.dry_run,
         strategy=args.strategy,
@@ -244,9 +268,18 @@ def cmd_balance(args, client: BudaClient) -> int:
         return 1
 
 
-def cmd_orderbook(args, client: BudaClient) -> int:
+def cmd_orderbook(args, client: BudaClient, registry: MarketRegistry) -> int:
     """Execute the orderbook command."""
-    market = args.market.lower()
+    market = args.market
+    if market is None:
+        # Default to first available market
+        market_ids = registry.market_ids()
+        if market_ids:
+            market = market_ids[0]
+        else:
+            print_status("No markets available", "ERROR")
+            return 1
+    market = market.lower()
 
     try:
         order_book = client.get_order_book(market)
@@ -295,16 +328,23 @@ def main() -> int:
     # Create API client
     client = BudaClient(config)
 
+    # Build market registry
+    try:
+        registry = MarketRegistry(client, config.quote_currency)
+    except Exception as e:
+        print_status(f"Failed to load markets: {e}", "ERROR")
+        return 1
+
     # Execute command
     try:
         if args.command == "buy":
-            return cmd_buy(args, client)
+            return cmd_buy(args, client, registry)
         elif args.command == "sell":
-            return cmd_sell(args, client)
+            return cmd_sell(args, client, registry)
         elif args.command == "balance":
             return cmd_balance(args, client)
         elif args.command == "orderbook":
-            return cmd_orderbook(args, client)
+            return cmd_orderbook(args, client, registry)
         else:
             parser.print_help()
             return 0

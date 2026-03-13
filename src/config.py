@@ -66,6 +66,11 @@ class Config:
         # Priority: explicit args > env vars from .env > os.environ
         self.api_key = api_key or env_vars.get("BUDA_API_KEY") or os.environ.get("BUDA_API_KEY")
         self.api_secret = api_secret or env_vars.get("BUDA_API_SECRET") or os.environ.get("BUDA_API_SECRET")
+        self.quote_currency = (
+            env_vars.get("BUDA_QUOTE_CURRENCY")
+            or os.environ.get("BUDA_QUOTE_CURRENCY")
+            or "clp"
+        ).lower()
 
     def validate(self) -> None:
         """

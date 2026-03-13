@@ -8,6 +8,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import List, Optional, Tuple
 
 from .api import BudaClient, BudaAPIError, InsufficientBalanceError
+from .market import MarketConfig
 from .utils import (
     format_clp,
     format_crypto,
@@ -22,28 +23,10 @@ from .ws import RealtimeClient
 class TradingBot:
     """Bot for placing and maintaining best bid/ask orders on Buda.com."""
 
-    # Minimum order amounts per market (in crypto)
-    MIN_AMOUNTS = {
-        "btc-clp": Decimal("0.00002"),
-        "usdc-clp": Decimal("0.01"),
-    }
-
-    # Minimum order value in CLP per market
-    MIN_CLP = {
-        "btc-clp": Decimal("2000"),
-        "usdc-clp": Decimal("10"),
-    }
-
-    # Price tick size per market (CLP)
-    PRICE_TICKS = {
-        "btc-clp": Decimal("1"),
-        "usdc-clp": Decimal("0.01"),
-    }
-
     def __init__(
         self,
         client: BudaClient,
-        currency: str,
+        market_config: MarketConfig,
         interval: int = 30,
         dry_run: bool = False,
         strategy: str = "top",
@@ -55,19 +38,19 @@ class TradingBot:
 
         Args:
             client: Buda API client instance.
-            currency: Currency to trade (btc, usdc).
+            market_config: Market configuration from registry.
             interval: Monitoring interval in seconds.
             dry_run: If True, simulate without executing orders.
         """
         self.client = client
-        self.currency = currency.lower()
-        self.market_id = f"{self.currency}-clp"
+        self.market_config = market_config
+        self.currency = market_config.base_currency
+        self.market_id = market_config.market_id
         self.interval = interval
         self.dry_run = dry_run
         self.strategy = strategy
         self.depth_ratio = Decimal(str(depth_ratio))
-        self.min_amount = self.MIN_AMOUNTS.get(
-            self.market_id, Decimal("0.00001"))
+        self.min_amount = market_config.min_order_amount
 
         if self.strategy not in {"top", "depth"}:
             raise BudaAPIError(f"Unknown strategy: {self.strategy}")
@@ -99,6 +82,10 @@ class TradingBot:
             signal.signal(signal.SIGINT, self._handle_interrupt)
             signal.signal(signal.SIGTERM, self._handle_interrupt)
 
+    def _fmt(self, amount) -> str:
+        """Format crypto amount using market's base decimals."""
+        return format_crypto(amount, self.currency, self.market_config.base_decimals)
+
     def cleanup(self):
         """Clean up active orders and show final summary. Does not exit."""
         print("\n")
@@ -125,7 +112,7 @@ class TradingBot:
                     else:
                         self.update_execution_tracking(traded_crypto, traded_clp)
                     print_status(
-                        f"Partial execution captured: {format_crypto(traded_crypto, self.currency)}", "INFO")
+                        f"Partial execution captured: {self._fmt(traded_crypto)}", "INFO")
 
             except BudaAPIError as e:
                 print_status(f"Failed to cancel order: {e}", "ERROR")
@@ -167,21 +154,22 @@ class TradingBot:
             self._realtime.stop()
             self._realtime = None
 
-    def verify_balance(self, clp_amount: Decimal) -> Decimal:
+    def verify_balance(self, amount: Decimal) -> Decimal:
         """
-        Verify CLP balance is sufficient for the order.
+        Verify quote-currency balance is sufficient for the order.
 
         Args:
-            clp_amount: Amount of CLP needed.
+            amount: Amount of quote currency needed.
 
         Returns:
-            Available CLP balance.
+            Available quote-currency balance.
 
         Raises:
             InsufficientBalanceError: If balance is insufficient.
         """
-        print_status("Checking CLP balance...", "INFO")
-        balance = self.client.get_balance("clp")
+        quote = self.market_config.quote_currency
+        print_status(f"Checking {quote.upper()} balance...", "INFO")
+        balance = self.client.get_balance(quote)
 
         # Handle both formats: [amount, currency] or just amount
         available = balance.get("available_amount", [0])[0]
@@ -191,9 +179,9 @@ class TradingBot:
 
         print_status(f"Available: {format_clp(available)}", "OK")
 
-        if available < clp_amount:
+        if available < amount:
             raise InsufficientBalanceError(
-                f"Insufficient balance. Have {format_clp(available)}, need {format_clp(clp_amount)}"
+                f"Insufficient balance. Have {format_clp(available)}, need {format_clp(amount)}"
             )
 
         return available
@@ -221,12 +209,12 @@ class TradingBot:
         available = Decimal(str(available))
 
         print_status(
-            f"Available: {format_crypto(available, currency)}", "OK")
+            f"Available: {self._fmt(available)}", "OK")
 
         if available < crypto_amount:
             raise InsufficientBalanceError(
-                f"Insufficient balance. Have {format_crypto(available, currency)}, "
-                f"need {format_crypto(crypto_amount, currency)}"
+                f"Insufficient balance. Have {self._fmt(available)}, "
+                f"need {self._fmt(crypto_amount)}"
             )
 
         return available
@@ -377,7 +365,7 @@ class TradingBot:
 
     def _price_tick(self) -> Decimal:
         """Return the minimum price increment for the current market."""
-        return self.PRICE_TICKS.get(self.market_id, Decimal("1"))
+        return self.market_config.price_tick
 
     def _round_price_up(self, price: Decimal) -> Decimal:
         """Round price up to the market tick size."""
@@ -457,12 +445,12 @@ class TradingBot:
         Raises:
             BudaAPIError: If the calculated amount is below minimum.
         """
-        amount = calculate_amount_for_clp(clp_amount, price, self.min_amount)
+        amount = calculate_amount_for_clp(clp_amount, price, self.min_amount, self.market_config.base_decimals)
 
         if amount < self.min_amount:
             raise BudaAPIError(
-                f"Order amount {format_crypto(amount, self.currency)} is below "
-                f"minimum {format_crypto(self.min_amount, self.currency)}"
+                f"Order amount {self._fmt(amount)} is below "
+                f"minimum {self._fmt(self.min_amount)}"
             )
 
         return amount
@@ -477,7 +465,8 @@ class TradingBot:
         Returns:
             Quantized crypto amount.
         """
-        return amount.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+        precision = Decimal(10) ** -self.market_config.base_decimals
+        return amount.quantize(precision, rounding=ROUND_DOWN)
 
     def is_best_bid(self, current_price: Decimal) -> bool:
         """
@@ -521,7 +510,7 @@ class TradingBot:
             limit_price = self._format_limit_price(price)
             print_status("[DRY RUN] Would place order:", "INFO")
             print(f"    Type: {order_type}")
-            print(f"    Amount: {format_crypto(amount, self.currency)}")
+            print(f"    Amount: {self._fmt(amount)}")
             print(f"    Price: {format_clp(price)}")
             print(f"    Total: {format_clp(amount * price)}")
             return {
@@ -612,6 +601,14 @@ class TradingBot:
         """
         return self._total_clp_target - self._total_clp_executed
 
+    def _estimate_min_clp(self) -> Decimal:
+        """Estimate minimum CLP value for an order using current price."""
+        try:
+            best_bid, _ = self.get_best_prices()
+            return self.min_amount * best_bid
+        except BudaAPIError:
+            return Decimal("2000")  # safe fallback
+
     def can_place_new_order(self, remaining_clp: Decimal) -> bool:
         """
         Check if remaining CLP is enough to place a new order.
@@ -622,7 +619,7 @@ class TradingBot:
         Returns:
             True if can place order, False if below minimum.
         """
-        min_clp = self.MIN_CLP.get(self.market_id, Decimal("2000"))
+        min_clp = self._estimate_min_clp()
         return remaining_clp >= min_clp
 
     def update_execution_tracking(self, traded_crypto: Decimal, traded_clp: Decimal) -> None:
@@ -657,7 +654,7 @@ class TradingBot:
             "INFO"
         )
         print_status(
-            f"Crypto received: {format_crypto(self._total_crypto_received, self.currency)}", "INFO")
+            f"Crypto received: {self._fmt(self._total_crypto_received)}", "INFO")
         print_status(f"Remaining: {format_clp(remaining)}", "INFO")
 
     def print_final_summary(self) -> None:
@@ -669,7 +666,7 @@ class TradingBot:
         print_status(f"Target: {format_clp(self._total_clp_target)}", "INFO")
         print_status(f"Executed: {format_clp(self._total_clp_executed)}", "OK")
         print_status(
-            f"Crypto received: {format_crypto(self._total_crypto_received, self.currency)}", "OK")
+            f"Crypto received: {self._fmt(self._total_crypto_received)}", "OK")
         if self._total_crypto_received > 0:
             avg_price = self._total_clp_executed / self._total_crypto_received
             print_status(f"Average price: {format_clp(avg_price)}", "INFO")
@@ -685,14 +682,14 @@ class TradingBot:
         progress_pct = (self._total_crypto_executed / self._total_crypto_target *
                         100) if self._total_crypto_target > 0 else Decimal("0")
         print_status(
-            f"Progress: {format_crypto(self._total_crypto_executed, self.currency)} / "
-            f"{format_crypto(self._total_crypto_target, self.currency)} ({progress_pct:.1f}%)",
+            f"Progress: {self._fmt(self._total_crypto_executed)} / "
+            f"{self._fmt(self._total_crypto_target)} ({progress_pct:.1f}%)",
             "INFO"
         )
         print_status(
             f"CLP received: {format_clp(self._total_clp_received)}", "INFO")
         print_status(
-            f"Remaining: {format_crypto(remaining, self.currency)}", "INFO")
+            f"Remaining: {self._fmt(remaining)}", "INFO")
 
     def print_sell_final_summary(self) -> None:
         """Print final sell execution summary."""
@@ -701,9 +698,9 @@ class TradingBot:
         print_status("EXECUTION SUMMARY", "INFO")
         print_status("=" * 50, "INFO")
         print_status(
-            f"Target: {format_crypto(self._total_crypto_target, self.currency)}", "INFO")
+            f"Target: {self._fmt(self._total_crypto_target)}", "INFO")
         print_status(
-            f"Executed: {format_crypto(self._total_crypto_executed, self.currency)}", "OK")
+            f"Executed: {self._fmt(self._total_crypto_executed)}", "OK")
         print_status(
             f"CLP received: {format_clp(self._total_clp_received)}", "OK")
         if self._total_crypto_executed > 0:
@@ -712,7 +709,7 @@ class TradingBot:
         remaining = self._total_crypto_target - self._total_crypto_executed
         if remaining > 0:
             print_status(
-                f"Remaining (not executed): {format_crypto(remaining, self.currency)}", "WARN")
+                f"Remaining (not executed): {self._fmt(remaining)}", "WARN")
         print_status("=" * 50, "INFO")
 
     def execute_buy_order(self, clp_amount: Decimal) -> None:
@@ -731,8 +728,8 @@ class TradingBot:
         self._total_clp_executed = Decimal("0")
         self._total_crypto_received = Decimal("0")
 
-        # Validate minimum CLP amount for this market
-        min_clp = self.MIN_CLP.get(self.market_id, Decimal("2000"))
+        # Validate minimum CLP amount for this market (estimated dynamically)
+        min_clp = self._estimate_min_clp()
         if clp_amount < min_clp:
             raise BudaAPIError(
                 f"Amount {format_clp(clp_amount)} is below minimum {format_clp(min_clp)} for {self.market_id.upper()}"
@@ -778,7 +775,7 @@ class TradingBot:
 
             print_status(f"Target price: {format_clp(target_price)}", "INFO")
             print_status(
-                f"Order amount: {format_crypto(amount, self.currency)}", "INFO")
+                f"Order amount: {self._fmt(amount)}", "INFO")
             print_status(
                 f"Estimated total: {format_clp(amount * target_price)}", "INFO")
             print()
@@ -832,7 +829,7 @@ class TradingBot:
                     new_traded_clp = traded_clp - last_traded_clp
                     if new_traded_crypto > 0:
                         print_status(
-                            f"Partial fill: +{format_crypto(new_traded_crypto, self.currency)}", "OK")
+                            f"Partial fill: +{self._fmt(new_traded_crypto)}", "OK")
                         last_traded_crypto = traded_crypto
                         last_traded_clp = traded_clp
 
@@ -939,7 +936,7 @@ class TradingBot:
                             self.update_execution_tracking(
                                 traded_crypto, traded_clp)
                             print_status(
-                                f"Partial execution before cancel: {format_crypto(traded_crypto, self.currency)}", "INFO")
+                                f"Partial execution before cancel: {self._fmt(traded_crypto)}", "INFO")
                             self.print_progress()
 
                         # Check if we can place a new order
@@ -960,7 +957,7 @@ class TradingBot:
                         print_status(
                             f"New target price: {format_clp(target_price)}", "INFO")
                         print_status(
-                            f"Order amount: {format_crypto(amount, self.currency)} ({format_clp(remaining_clp)})", "INFO")
+                            f"Order amount: {self._fmt(amount)} ({format_clp(remaining_clp)})", "INFO")
 
                         # Place new order
                         order = self.place_order(amount, target_price)
@@ -997,13 +994,13 @@ class TradingBot:
 
         if crypto_amount < self.min_amount:
             raise BudaAPIError(
-                f"Amount {format_crypto(crypto_amount, self.currency)} is below minimum "
-                f"{format_crypto(self.min_amount, self.currency)} for {self.market_id.upper()}"
+                f"Amount {self._fmt(crypto_amount)} is below minimum "
+                f"{self._fmt(self.min_amount)} for {self.market_id.upper()}"
             )
 
         print_status(f"Starting {self.currency.upper()} sell bot", "INFO")
         print_status(
-            f"Target sell: {format_crypto(crypto_amount, self.currency)}", "INFO")
+            f"Target sell: {self._fmt(crypto_amount)}", "INFO")
         print_status(f"Market: {self.market_id.upper()}", "INFO")
         print_status(f"Check interval: {self.interval}s", "INFO")
         if self.dry_run:
@@ -1042,13 +1039,13 @@ class TradingBot:
 
             if amount < self.min_amount:
                 raise BudaAPIError(
-                    f"Order amount {format_crypto(amount, self.currency)} is below "
-                    f"minimum {format_crypto(self.min_amount, self.currency)}"
+                    f"Order amount {self._fmt(amount)} is below "
+                    f"minimum {self._fmt(self.min_amount)}"
                 )
 
             print_status(f"Target price: {format_clp(target_price)}", "INFO")
             print_status(
-                f"Order amount: {format_crypto(amount, self.currency)}", "INFO")
+                f"Order amount: {self._fmt(amount)}", "INFO")
             print_status(
                 f"Estimated total: {format_clp(amount * target_price)}", "INFO")
             print()
@@ -1102,7 +1099,7 @@ class TradingBot:
                     new_traded_clp = traded_clp - last_traded_clp
                     if new_traded_crypto > 0:
                         print_status(
-                            f"Partial fill: +{format_crypto(new_traded_crypto, self.currency)}", "OK")
+                            f"Partial fill: +{self._fmt(new_traded_crypto)}", "OK")
                         last_traded_crypto = traded_crypto
                         last_traded_clp = traded_clp
 
@@ -1128,7 +1125,7 @@ class TradingBot:
                             self._total_crypto_executed
                         if remaining_crypto < self.min_amount:
                             print_status(
-                                f"Remaining {format_crypto(remaining_crypto, self.currency)} is below minimum. Finishing.", "WARN")
+                                f"Remaining {self._fmt(remaining_crypto)} is below minimum. Finishing.", "WARN")
                             self.print_sell_final_summary()
                             return
 
@@ -1141,7 +1138,7 @@ class TradingBot:
                         )
                         amount = self.quantize_crypto_amount(remaining_crypto)
                         print_status(
-                            f"Placing new order with remaining {format_crypto(remaining_crypto, self.currency)}", "INFO")
+                            f"Placing new order with remaining {self._fmt(remaining_crypto)}", "INFO")
                         order = self.place_order(
                             amount, target_price, order_type="Ask")
                         order_id = order.get("id")
@@ -1207,14 +1204,14 @@ class TradingBot:
                             self.update_sell_execution_tracking(
                                 traded_crypto, traded_clp)
                             print_status(
-                                f"Partial execution before cancel: {format_crypto(traded_crypto, self.currency)}", "INFO")
+                                f"Partial execution before cancel: {self._fmt(traded_crypto)}", "INFO")
                             self.print_sell_progress()
 
                         remaining_crypto = self._total_crypto_target - \
                             self._total_crypto_executed
                         if remaining_crypto < self.min_amount:
                             print_status(
-                                f"Remaining {format_crypto(remaining_crypto, self.currency)} is below minimum. Finishing.", "WARN")
+                                f"Remaining {self._fmt(remaining_crypto)} is below minimum. Finishing.", "WARN")
                             self.print_sell_final_summary()
                             return
 
@@ -1226,7 +1223,7 @@ class TradingBot:
                         print_status(
                             f"New target price: {format_clp(target_price)}", "INFO")
                         print_status(
-                            f"Order amount: {format_crypto(amount, self.currency)}", "INFO")
+                            f"Order amount: {self._fmt(amount)}", "INFO")
 
                         order = self.place_order(
                             amount, target_price, order_type="Ask")
