@@ -6,6 +6,7 @@ Incluye:
 - modo interactivo TUI (menú en terminal),
 - modo CLI con subcomandos,
 - estrategias de precio `top` y `depth`,
+- estrategia de grilla (`grid`) con rango manual o automático,
 - order book en tiempo real por WebSocket con fallback a REST,
 - tracking de ejecuciones parciales con resumen final.
 
@@ -13,6 +14,10 @@ Incluye:
 
 - Python 3.10+
 - API key/secret de Buda: https://www.buda.com/api-keys
+
+## Uso seguro
+
+Los comandos `buy` y `sell` publican y cancelan órdenes reales cuando no usas `--dry-run`. Antes de operar con montos reales, prueba el flujo con `--dry-run` y revisa que `BUDA_QUOTE_CURRENCY` apunte a la moneda quote correcta (`clp`, `cop` o `pen`).
 
 ## Instalación
 
@@ -100,6 +105,71 @@ python3 -m src.main orderbook btc-clp
 python3 -m src.main orderbook usdc-clp
 ```
 
+## Estrategia de grilla (`grid`)
+
+La grilla mantiene múltiples órdenes límite en un rango de precios. Cuando se ejecuta una compra en un nivel, publica una venta en el siguiente; cuando se ejecuta una venta, publica una compra en el nivel anterior.
+
+> **Importante:** la grilla mueve fondos reales cuando no usas `--dry-run`. Antes de operar con dinero real, prueba siempre el flujo en `dry-run` y revisa los niveles generados.
+
+### Rango manual
+
+Tú fijas `--lower` y `--upper`, el bot genera `--levels` precios redondeados al tick del mercado:
+
+```bash
+python3 -m src.main grid btc \
+  --lower 90000000 \
+  --upper 110000000 \
+  --levels 12 \
+  --quote-budget 500000 \
+  --max-open-orders 6 \
+  --interval 10 \
+  --dry-run
+```
+
+### Rango automático
+
+Tú fijas `--range-pct`; el bot lo centra en el precio medio del order book:
+
+```bash
+python3 -m src.main grid btc \
+  --range-pct 10 \
+  --levels 12 \
+  --quote-budget 500000 \
+  --max-open-orders 6 \
+  --interval 10 \
+  --dry-run
+```
+
+### Parámetros
+
+| Flag | Descripción |
+|------|-------------|
+| `--lower` / `--upper` | Bordes del rango (modo manual) |
+| `--range-pct` | Distancia porcentual desde el precio actual hacia `lower` y `upper`; `10` = `-10%` / `+10%` (banda total `20%`) |
+| `--levels` | Cantidad de niveles (>= 2) |
+| `--quote-budget` | Tope de moneda quote a comprometer en compras |
+| `--base-budget` | Tope de base para ventas iniciales (default `0`) |
+| `--max-open-orders` | Máximo de órdenes abiertas en simultáneo (default `6`) |
+| `--interval` | Intervalo de monitoreo en segundos (default `10`) |
+| `--dry-run` | No publica órdenes reales, sólo muestra la grilla |
+
+### Comportamiento
+
+- Sin `--base-budget`, la grilla parte sólo con compras bajo el precio actual.
+- Con `--base-budget`, también se publican ventas iniciales arriba del precio actual.
+- `quote_budget` se reparte entre las compras iniciales permitidas (`min(niveles_compra, max_open_orders)`).
+- Cualquier orden que cruzaría el spread es omitida: las iniciales se difieren a una cola y se reintentan en cada tick; los espejos se reintentan en el siguiente tick.
+- Si **ninguna** orden inicial logra colocarse, la grilla aborta con error claro en vez de quedar inactiva en silencio.
+- En `Ctrl+C`, cancela todas las órdenes activas, espera la confirmación de cancelación de cada una y muestra resumen (compras, ventas, inventario neto, PnL bruto en quote).
+- El bot rechaza configuraciones donde el monto por nivel queda bajo el mínimo de mercado o donde los niveles colapsan al redondear al tick.
+
+### Riesgos
+
+- La grilla reserva saldo en Buda con cada orden abierta; verifica que `--quote-budget` no exceda tu saldo disponible.
+- Si el precio sale del rango, la grilla deja de operar en ese lado hasta volver al rango.
+- No persiste estado entre reinicios: cancela manualmente cualquier orden colgada antes de relanzar.
+- No incorpora fees en el cálculo de PnL; el resumen muestra PnL bruto.
+
 ## Estrategias de precio
 
 ### `top` (default)
@@ -107,6 +177,8 @@ python3 -m src.main orderbook usdc-clp
 Posiciona la orden un tick por encima (compra) o por debajo (venta) de la mejor oferta:
 - **Compra:** `best_bid + tick`
 - **Venta:** `best_ask - tick`
+
+Si ese precio cruzaría el spread, el bot conserva el `best_bid` o `best_ask` actual para evitar ejecución inmediata.
 
 ### `depth`
 
@@ -156,6 +228,8 @@ bot-buda/
     ├── auth.py           # Firma HMAC-SHA384
     ├── api.py            # Cliente REST con retry y rate limiting
     ├── bot.py            # Lógica de trading: estrategias, monitoring loop
+    ├── grid.py           # Motor de grilla (estrategia separada)
+    ├── grid_types.py     # Dataclasses GridConfig / GridLevel / GridOrder
     ├── market.py         # Registro dinámico de mercados desde la API
     ├── ws.py             # Cliente WebSocket (order book + órdenes)
     ├── utils.py          # Formateo y utilidades

@@ -13,6 +13,7 @@ def prompt_main_menu() -> str:
         choices=[
             {"name": "Comprar", "value": "buy"},
             {"name": "Vender", "value": "sell"},
+            {"name": "Grilla", "value": "grid"},
             Separator(),
             {"name": "Ver Balances", "value": "balance"},
             {"name": "Ver Order Book", "value": "orderbook"},
@@ -259,6 +260,107 @@ def prompt_sell_params(
         "amount": amount_str if unit == "crypto" else raw_amount,
         "strategy": strategy,
         "depth_ratio": depth_ratio,
+        "interval": interval,
+        "dry_run": dry_run,
+    }
+
+
+def _validate_positive_decimal(val: str) -> bool:
+    try:
+        return Decimal(val) > 0
+    except (InvalidOperation, TypeError):
+        return False
+
+
+def _validate_positive_int(val: str) -> bool:
+    try:
+        return int(val) > 0
+    except (ValueError, TypeError):
+        return False
+
+
+def prompt_grid_params(currencies: list[str], quote_currency: str = "clp") -> dict | None:
+    """Run the grid flow prompts. Returns params dict or None if cancelled."""
+    currency = _prompt_currency(currencies)
+    if currency is None:
+        return None
+
+    qc_label = quote_currency.upper()
+
+    range_mode = inquirer.select(
+        message="Modo de rango:",
+        choices=[
+            {"name": "Automatico (% sobre precio actual)", "value": "auto"},
+            {"name": "Manual (lower/upper)", "value": "manual"},
+        ],
+        default="auto",
+    ).execute()
+
+    lower = upper = range_pct = None
+    if range_mode == "auto":
+        pct_str = inquirer.text(
+            message="Rango como % del precio actual (ej. 10):",
+            default="10",
+            validate=_validate_positive_decimal,
+            invalid_message="Debe ser un numero positivo",
+        ).execute()
+        range_pct = Decimal(pct_str)
+    else:
+        lower_str = inquirer.text(
+            message=f"Precio inferior ({qc_label}):",
+            validate=_validate_positive_decimal,
+            invalid_message="Debe ser un numero positivo",
+        ).execute()
+        upper_str = inquirer.text(
+            message=f"Precio superior ({qc_label}):",
+            validate=_validate_positive_decimal,
+            invalid_message="Debe ser un numero positivo",
+        ).execute()
+        lower = Decimal(lower_str)
+        upper = Decimal(upper_str)
+        if lower >= upper:
+            return None
+
+    levels_str = inquirer.text(
+        message="Cantidad de niveles (>= 2):",
+        default="12",
+        validate=lambda v: _validate_positive_int(v) and int(v) >= 2,
+        invalid_message="Debe ser un entero >= 2",
+    ).execute()
+
+    quote_budget_str = inquirer.text(
+        message=f"Quote budget ({qc_label}):",
+        validate=_validate_positive_decimal,
+        invalid_message="Debe ser un numero positivo",
+    ).execute()
+
+    base_budget_str = inquirer.text(
+        message=f"Base budget ({currency.upper()}, 0 si no quieres ventas iniciales):",
+        default="0",
+        validate=lambda v: _validate_positive_decimal(v) or v == "0",
+        invalid_message="Debe ser un numero >= 0",
+    ).execute()
+
+    max_open_str = inquirer.text(
+        message="max_open_orders:",
+        default="6",
+        validate=_validate_positive_int,
+        invalid_message="Debe ser un entero positivo",
+    ).execute()
+
+    interval = _prompt_interval()
+    dry_run = _prompt_dry_run()
+
+    return {
+        "side": "grid",
+        "currency": currency,
+        "lower": lower,
+        "upper": upper,
+        "range_pct": range_pct,
+        "levels": int(levels_str),
+        "quote_budget": Decimal(quote_budget_str),
+        "base_budget": Decimal(base_budget_str),
+        "max_open_orders": int(max_open_str),
         "interval": interval,
         "dry_run": dry_run,
     }

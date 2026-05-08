@@ -7,6 +7,8 @@ from rich.console import Console
 from ..api import BudaClient, BudaAPIError, AuthenticationError
 from ..bot import TradingBot
 from ..config import Config, ConfigError
+from ..grid import GridTradingBot
+from ..grid_types import GridConfig, GridConfigError
 from ..market import MarketRegistry, KNOWN_DECIMALS
 from ..utils import format_clp, format_crypto
 from .display import (
@@ -15,11 +17,13 @@ from .display import (
     print_single_balance,
     print_order_book_table,
     print_order_summary,
+    print_grid_summary,
 )
 from .prompts import (
     prompt_main_menu,
     prompt_buy_params,
     prompt_sell_params,
+    prompt_grid_params,
     prompt_balance_currency,
     prompt_orderbook_market,
     _prompt_confirm,
@@ -70,6 +74,8 @@ def launch_tui() -> int:
                 _handle_buy(console, client, registry, usd_unit_available, quote_decimals)
             elif action == "sell":
                 _handle_sell(console, client, registry, usd_unit_available, quote_decimals)
+            elif action == "grid":
+                _handle_grid(console, client, registry)
             elif action == "balance":
                 _handle_balance(console, client)
             elif action == "orderbook":
@@ -244,6 +250,55 @@ def _run_bot(console: Console, client: BudaClient, registry: MarketRegistry, par
     except KeyboardInterrupt:
         bot.cleanup()
         console.print("\n[yellow]Bot detenido. Volviendo al menu...[/yellow]\n")
+    except BudaAPIError as e:
+        console.print(f"\n[red]Error de trading: {e}[/red]\n")
+
+
+def _handle_grid(console: Console, client: BudaClient, registry: MarketRegistry) -> None:
+    """Handle the grid flow."""
+    try:
+        params = prompt_grid_params(registry.currencies(), registry.quote_currency)
+    except KeyboardInterrupt:
+        console.print()
+        return
+
+    if params is None:
+        return
+
+    market_config = registry.get_by_currency(params["currency"])
+    config = GridConfig(
+        market_config=market_config,
+        lower_price=params["lower"],
+        upper_price=params["upper"],
+        range_pct=params["range_pct"],
+        levels=params["levels"],
+        quote_budget=params["quote_budget"],
+        base_budget=params["base_budget"],
+        max_open_orders=params["max_open_orders"],
+        interval=params["interval"],
+        dry_run=params["dry_run"],
+    )
+
+    print_grid_summary(console, params)
+
+    try:
+        if not _prompt_confirm():
+            console.print("[dim]Grilla cancelada.[/dim]\n")
+            return
+    except KeyboardInterrupt:
+        console.print()
+        return
+
+    bot = GridTradingBot(client=client, config=config, register_signals=False)
+    console.print("[bold green]Grilla iniciada.[/bold green] Presiona Ctrl+C para detener.\n")
+
+    try:
+        bot.execute()
+    except KeyboardInterrupt:
+        bot.cleanup()
+        console.print("\n[yellow]Grilla detenida. Volviendo al menu...[/yellow]\n")
+    except GridConfigError as e:
+        console.print(f"\n[red]Configuracion invalida: {e}[/red]\n")
     except BudaAPIError as e:
         console.print(f"\n[red]Error de trading: {e}[/red]\n")
 

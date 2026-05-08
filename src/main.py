@@ -8,6 +8,8 @@ from decimal import Decimal
 from .api import BudaClient, AuthenticationError, BudaAPIError
 from .bot import TradingBot
 from .config import Config, ConfigError
+from .grid import GridTradingBot
+from .grid_types import GridConfig, GridConfigError
 from .market import MarketRegistry
 from .utils import format_clp, print_status
 
@@ -27,6 +29,8 @@ Examples:
   python -m src.main sell btc 0.001        # Sell 0.001 BTC
   python -m src.main sell usdc 50          # Sell 50 USDC
   python -m src.main sell btc 0.001 --strategy depth --depth 0.9
+  python -m src.main grid btc --range-pct 10 --levels 12 --quote-budget 500000 --max-open-orders 6 --dry-run
+  python -m src.main grid btc --lower 90000000 --upper 110000000 --levels 12 --quote-budget 500000 --max-open-orders 6 --dry-run
         """
     )
 
@@ -110,6 +114,69 @@ Examples:
         type=float,
         default=0.9,
         help="Depth ratio for strategy=depth (0-1, default: 0.9)"
+    )
+
+    # Grid command
+    grid_parser = subparsers.add_parser("grid", help="Run a grid trading strategy")
+    grid_parser.add_argument(
+        "currency",
+        type=str,
+        help="Base currency for the grid (e.g. btc, eth, usdc)"
+    )
+    grid_parser.add_argument(
+        "--lower",
+        type=str,
+        default=None,
+        help="Lower bound of the grid (manual range mode)"
+    )
+    grid_parser.add_argument(
+        "--upper",
+        type=str,
+        default=None,
+        help="Upper bound of the grid (manual range mode)"
+    )
+    grid_parser.add_argument(
+        "--range-pct",
+        type=str,
+        default=None,
+        help="Auto range as +/- percent of current price (e.g. 10 = lower 90%% / upper 110%%)"
+    )
+    grid_parser.add_argument(
+        "--levels",
+        type=int,
+        required=True,
+        help="Number of price levels in the grid (>= 2)"
+    )
+    grid_parser.add_argument(
+        "--quote-budget",
+        type=str,
+        required=True,
+        help="Maximum quote-currency budget the grid can deploy"
+    )
+    grid_parser.add_argument(
+        "--base-budget",
+        type=str,
+        default="0",
+        help="Maximum base-currency budget for initial sells (default 0)"
+    )
+    grid_parser.add_argument(
+        "--max-open-orders",
+        type=int,
+        default=6,
+        help="Maximum simultaneously open grid orders (default 6)"
+    )
+    grid_parser.add_argument(
+        "--interval",
+        "-i",
+        type=int,
+        default=10,
+        help="Monitoring interval in seconds (default 10)"
+    )
+    grid_parser.add_argument(
+        "--dry-run",
+        "-d",
+        action="store_true",
+        help="Simulate without placing real orders"
     )
 
     # Balance command (for testing)
@@ -228,6 +295,72 @@ def cmd_sell(args, client: BudaClient, registry: MarketRegistry) -> int:
         return 1
 
 
+def cmd_grid(args, client: BudaClient, registry: MarketRegistry) -> int:
+    """Execute the grid command."""
+    currency = args.currency.lower()
+
+    available = registry.currencies()
+    if currency not in available:
+        print_status(
+            f"Currency '{currency}' not available. Options: {', '.join(available)}",
+            "ERROR",
+        )
+        return 1
+
+    market_config = registry.get_by_currency(currency)
+
+    manual = args.lower is not None or args.upper is not None
+    auto = args.range_pct is not None
+    if manual and auto:
+        print_status("Usa --lower/--upper o --range-pct, no ambos", "ERROR")
+        return 1
+    if not manual and not auto:
+        print_status("Especifica --lower/--upper o --range-pct", "ERROR")
+        return 1
+    if manual and (args.lower is None or args.upper is None):
+        print_status("--lower y --upper son obligatorios juntos", "ERROR")
+        return 1
+
+    try:
+        lower = Decimal(args.lower) if args.lower is not None else None
+        upper = Decimal(args.upper) if args.upper is not None else None
+        range_pct = Decimal(args.range_pct) if args.range_pct is not None else None
+        quote_budget = Decimal(args.quote_budget)
+        base_budget = Decimal(args.base_budget)
+    except Exception as e:
+        print_status(f"Parametro invalido: {e}", "ERROR")
+        return 1
+
+    config = GridConfig(
+        market_config=market_config,
+        lower_price=lower,
+        upper_price=upper,
+        range_pct=range_pct,
+        levels=args.levels,
+        quote_budget=quote_budget,
+        base_budget=base_budget,
+        max_open_orders=args.max_open_orders,
+        interval=args.interval,
+        dry_run=args.dry_run,
+    )
+
+    bot = GridTradingBot(client=client, config=config)
+
+    print_status("Buda.com Grid Bot", "INFO")
+    print_status("=" * 40, "INFO")
+    print()
+
+    try:
+        bot.execute()
+        return 0
+    except GridConfigError as e:
+        print_status(f"Configuracion invalida: {e}", "ERROR")
+        return 1
+    except BudaAPIError as e:
+        print_status(f"Trading error: {e}", "ERROR")
+        return 1
+
+
 def cmd_balance(args, client: BudaClient) -> int:
     """Execute the balance command."""
     def _print_balance(balance: dict, currency: str) -> None:
@@ -341,6 +474,8 @@ def main() -> int:
             return cmd_buy(args, client, registry)
         elif args.command == "sell":
             return cmd_sell(args, client, registry)
+        elif args.command == "grid":
+            return cmd_grid(args, client, registry)
         elif args.command == "balance":
             return cmd_balance(args, client)
         elif args.command == "orderbook":

@@ -103,6 +103,31 @@ def print_order_book_table(console: Console, order_book: dict, market: str) -> N
     console.print()
 
 
+def print_grid_summary(console: Console, params: dict) -> None:
+    """Print a confirmation panel before launching a grid."""
+    currency = params["currency"].upper()
+
+    lines = [f"[bold]Mercado:[/bold] {currency}"]
+    if params["range_pct"] is not None:
+        lines.append(f"[bold]Rango:[/bold] automatico (+/- {params['range_pct']}% sobre precio actual)")
+    else:
+        lines.append(f"[bold]Lower:[/bold] {format_clp(params['lower'])}")
+        lines.append(f"[bold]Upper:[/bold] {format_clp(params['upper'])}")
+    lines.append(f"[bold]Levels:[/bold] {params['levels']}")
+    lines.append(f"[bold]Quote budget:[/bold] {format_clp(params['quote_budget'])}")
+    if params["base_budget"] > 0:
+        lines.append(f"[bold]Base budget:[/bold] {params['base_budget']} {currency}")
+    lines.append(f"[bold]max_open_orders:[/bold] {params['max_open_orders']}")
+    lines.append(f"[bold]Intervalo:[/bold] {params['interval']}s")
+    lines.append(f"[bold]Dry run:[/bold] {'Si' if params['dry_run'] else 'No'}")
+
+    title = "Resumen Grilla"
+    border = "yellow" if params["dry_run"] else "red"
+
+    console.print(Panel("\n".join(lines), title=title, border_style=border, expand=False))
+    console.print()
+
+
 def print_order_summary(console: Console, params: dict) -> None:
     """Print a confirmation panel before executing an order."""
     side = params.get("side", "buy")
