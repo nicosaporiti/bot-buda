@@ -4,7 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Bot CLI en Python para comprar BTC o USDC en Buda.com con órdenes límite que mantienen la mejor posición de compra (best bid) automáticamente. The bot monitors the order book and automatically replaces orders to stay at the top of the buy side.
+Bot CLI en Python para comprar o vender mercados spot en Buda.com con órdenes
+límite y estrategias `top`/`depth`; también incluye una estrategia de grilla.
+The bot monitors the order book and replaces active orders when their strategy
+target changes.
 
 ## Commands
 
@@ -42,9 +45,9 @@ python3 -m src.main orderbook btc-clp
 main.py → TradingBot.execute_buy_order()
   ├─ verify_balance()
   ├─ get_best_prices()
-  ├─ calculate_optimal_price() → best_bid + 1 CLP
+  ├─ calculate_strategy_price() → one market tick beyond the best competing bid
   ├─ place_order()
-  └─ monitoring loop: check if still best bid, reposition if outbid
+  └─ monitoring loop: exclude unambiguous own levels and reprice whenever the one-tick-ahead target changes
 ```
 
 ## Key Technical Details

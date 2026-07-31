@@ -178,6 +178,15 @@ Posiciona la orden un tick por encima (compra) o por debajo (venta) de la mejor 
 - **Compra:** `best_bid + tick`
 - **Venta:** `best_ask - tick`
 
+Cuando el volumen de la mejor punta coincide con el remanente de la orden
+activa, el bot reconoce ese nivel como propio y usa la siguiente punta como
+referencia. Si esa segunda punta se aleja, también recotiza hacia ella para
+quedar a un solo tick, en vez de mantener un precio innecesariamente agresivo.
+Si el volumen está agregado o momentáneamente desincronizado, conserva el precio
+hasta tener una referencia inequívoca.
+Después de cancelar, recuerda temporalmente ese nivel como propio para que la
+propagación tardía del book no revierta la nueva cotización.
+
 Si ese precio cruzaría el spread, el bot conserva el `best_bid` o `best_ask` actual para evitar ejecución inmediata.
 
 ### `depth`
@@ -197,7 +206,10 @@ El bot usa WebSocket para recibir:
 - **Estado de órdenes** propias (`orders@{pubsub_key}`, si está disponible)
 
 Comportamiento:
+
 - espera snapshot inicial del book antes de operar,
+- si recibe deltas antes del snapshot o después de reconectar, solicita de
+  inmediato un snapshot completo por REST,
 - si el stream está stale (sin updates recientes), cae a REST automáticamente,
 - realiza sanity check periódico cada 120s por REST para refrescar el snapshot.
 

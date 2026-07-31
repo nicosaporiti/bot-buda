@@ -18,37 +18,101 @@ class OrderBookState:
         self._bids: Dict[Decimal, Decimal] = {}
         self._asks: Dict[Decimal, Decimal] = {}
         self._lock = threading.Lock()
+        self._state_changed = threading.Condition(self._lock)
         self._ready = threading.Event()
         self._top_changed = threading.Event()
+        self._snapshot_required = False
+        self._version = 0
         self._last_snapshot_ts = 0.0
         self._last_update_ts = 0.0
 
     def apply_snapshot(self, bids, asks) -> None:
-        """Replace the entire book."""
+        """Apply an authoritative WebSocket snapshot."""
         with self._lock:
-            self._bids = self._parse_side(bids)
-            self._asks = self._parse_side(asks)
-            now = time.time()
-            self._last_snapshot_ts = now
-            self._last_update_ts = now
-            self._ready.set()
-            self._top_changed.set()
+            self._replace_book(bids, asks)
 
-    def apply_change(self, side: str, price: str, amount: str) -> None:
-        """Apply a single price level change."""
+    def snapshot_version(self) -> int:
+        """Return a token used to reject stale REST snapshots."""
+        with self._lock:
+            return self._version
+
+    def apply_snapshot_if_current(self, version: int, bids, asks) -> bool:
+        """Apply a REST snapshot only if no newer book event was observed."""
+        with self._lock:
+            if version != self._version:
+                return False
+            self._replace_book(bids, asks)
+            return True
+
+    def seed_snapshot_if_unready(self, bids, asks) -> bool:
+        """Establish a REST baseline while preserving a newer resync request."""
+        with self._lock:
+            if self._ready.is_set():
+                return False
+            self._replace_book(bids, asks, clear_snapshot_request=False)
+            return True
+
+    def _replace_book(
+        self,
+        bids,
+        asks,
+        clear_snapshot_request: bool = True,
+    ) -> None:
+        self._bids = self._parse_side(bids)
+        self._asks = self._parse_side(asks)
+        now = time.time()
+        self._last_snapshot_ts = now
+        self._last_update_ts = now
+        if clear_snapshot_request:
+            self._snapshot_required = False
+        self._version += 1
+        self._ready.set()
+        self._top_changed.set()
+        self._state_changed.notify_all()
+
+    def apply_change(self, side: str, price: str, amount_change: str) -> None:
+        """Apply a volume delta to a single price level."""
+        price_dec = Decimal(str(price))
+        delta = Decimal(str(amount_change))
+        with self._lock:
+            if not self._ready.is_set():
+                self._request_snapshot()
+                return
+            book = self._bids if side == "bid" else self._asks
+            updated_amount = book.get(price_dec, Decimal("0")) + delta
+            if updated_amount <= 0:
+                book.pop(price_dec, None)
+            else:
+                book[price_dec] = updated_amount
+            self._record_update()
+
+    def apply_level(self, side: str, price: str, amount: str) -> None:
+        """Set an absolute price-level volume for legacy event formats."""
         price_dec = Decimal(str(price))
         amount_dec = Decimal(str(amount))
         with self._lock:
+            if not self._ready.is_set():
+                self._request_snapshot()
+                return
             book = self._bids if side == "bid" else self._asks
             if amount_dec <= 0:
                 book.pop(price_dec, None)
             else:
                 book[price_dec] = amount_dec
-            now = time.time()
-            self._last_update_ts = now
-            if not self._ready.is_set():
-                self._ready.set()
+            self._record_update()
+
+    def _record_update(self) -> None:
+        self._last_update_ts = time.time()
+        self._version += 1
+        self._top_changed.set()
+
+    def _request_snapshot(self, force_wake: bool = False) -> None:
+        was_required = self._snapshot_required
+        self._snapshot_required = True
+        self._version += 1
+        if force_wake or not was_required:
             self._top_changed.set()
+            self._state_changed.notify_all()
 
     def get_best(self) -> Optional[Tuple[Decimal, Decimal]]:
         """Return (best_bid, best_ask) or None if not ready."""
@@ -74,13 +138,24 @@ class OrderBookState:
             self._last_snapshot_ts = 0.0
             self._last_update_ts = 0.0
             self._ready.clear()
+            self._request_snapshot(force_wake=True)
+
+    def needs_snapshot(self) -> bool:
+        """Return whether consumers must seed the book from a full snapshot."""
+        with self._lock:
+            return self._snapshot_required
 
     def wait_ready(self, timeout: float) -> bool:
-        """Wait for initial snapshot."""
-        return self._ready.wait(timeout)
+        """Wait until a snapshot arrives or REST fallback becomes necessary."""
+        with self._state_changed:
+            self._state_changed.wait_for(
+                lambda: self._ready.is_set() or self._snapshot_required,
+                timeout,
+            )
+            return self._ready.is_set()
 
     def wait_for_top_change(self, timeout: float) -> bool:
-        """Wait for a top-of-book change or timeout."""
+        """Wait for book activity, a resync request, or timeout."""
         changed = self._top_changed.wait(timeout)
         if changed:
             self._top_changed.clear()
@@ -221,13 +296,22 @@ class RealtimeClient:
             payload = json.loads(message)
         except json.JSONDecodeError:
             return
+        if not isinstance(payload, dict):
+            return
 
         event = payload.get("ev")
         data = payload.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
 
         if event == "book-sync":
-            bids = data.get("bids", [])
-            asks = data.get("asks", [])
+            order_book = payload.get("order_book")
+            if not isinstance(order_book, dict):
+                order_book = data.get("order_book", data)
+            if not isinstance(order_book, dict):
+                return
+            bids = order_book.get("bids", [])
+            asks = order_book.get("asks", [])
             self.book_state.apply_snapshot(bids, asks)
         elif event == "book-changed":
             # Accept change array format: ["bids","price","amount"]
@@ -244,16 +328,16 @@ class RealtimeClient:
             if "bids" in data or "asks" in data:
                 for entry in data.get("bids", []):
                     if len(entry) >= 2:
-                        self.book_state.apply_change("bid", entry[0], entry[1])
+                        self.book_state.apply_level("bid", entry[0], entry[1])
                 for entry in data.get("asks", []):
                     if len(entry) >= 2:
-                        self.book_state.apply_change("ask", entry[0], entry[1])
+                        self.book_state.apply_level("ask", entry[0], entry[1])
             else:
                 side = data.get("side")
                 price = data.get("price")
                 amount = data.get("amount")
                 if side in ("bid", "ask") and price is not None and amount is not None:
-                    self.book_state.apply_change(side, price, amount)
+                    self.book_state.apply_level(side, price, amount)
 
     def _on_book_open(self, _ws) -> None:
         # Force a fresh snapshot after reconnect.

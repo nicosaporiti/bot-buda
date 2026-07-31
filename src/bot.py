@@ -4,6 +4,7 @@ import os
 import signal
 import sys
 import time
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import List, Optional, Tuple
 
@@ -18,6 +19,13 @@ from .utils import (
     print_order_info,
 )
 from .ws import RealtimeClient
+
+
+@dataclass(frozen=True)
+class _CanceledLevel:
+    price: Decimal
+    remaining_amount: Decimal
+    recorded_at: float
 
 
 class TradingBot:
@@ -64,6 +72,8 @@ class TradingBot:
         self._min_action_interval = 0.5
         self._last_sanity_ts = 0.0
         self._sanity_interval = 120.0
+        self._last_snapshot_attempt_ts = 0.0
+        self._snapshot_retry_interval = max(min(float(interval), 5.0), 1.0)
 
         # Execution tracking for partial fills
         self._total_clp_target: Decimal = Decimal("0")
@@ -76,6 +86,12 @@ class TradingBot:
         self._total_clp_received: Decimal = Decimal("0")
 
         self._active_side: Optional[str] = None
+        self._recently_canceled_orders: dict[str, dict[str, _CanceledLevel]] = {
+            "buy": {},
+            "sell": {},
+        }
+        self._canceled_level_ttl = max(float(interval) * 2, 5.0)
+        self._accounted_terminal_orders: set[str] = set()
 
         # Setup signal handlers for clean exit
         if register_signals:
@@ -250,7 +266,22 @@ class TradingBot:
 
         return best_bid, best_ask
 
-    def get_order_book_levels(self) -> Tuple[List[Tuple[Decimal, Decimal]], List[Tuple[Decimal, Decimal]]]:
+    def _realtime_book_levels(
+        self,
+    ) -> Optional[Tuple[List[Tuple[Decimal, Decimal]], List[Tuple[Decimal, Decimal]]]]:
+        if not self._realtime:
+            return None
+        bids, asks = self._realtime.book_state.get_snapshot()
+        if not bids or not asks:
+            return None
+        return (
+            sorted(bids.items(), key=lambda item: item[0], reverse=True),
+            sorted(asks.items(), key=lambda item: item[0]),
+        )
+
+    def get_order_book_levels(
+        self,
+    ) -> Tuple[List[Tuple[Decimal, Decimal]], List[Tuple[Decimal, Decimal]]]:
         """
         Return order book levels as lists of (price, amount) tuples.
 
@@ -259,28 +290,98 @@ class TradingBot:
         if self._realtime:
             max_age = max(self.interval * 3, 1.0)
             if not self._realtime.book_state.is_stale(max_age):
-                bids_dict, asks_dict = self._realtime.book_state.get_snapshot()
-                if bids_dict and asks_dict:
-                    bids = sorted(bids_dict.items(), key=lambda x: x[0], reverse=True)
-                    asks = sorted(asks_dict.items(), key=lambda x: x[0])
-                    return bids, asks
+                live_levels = self._realtime_book_levels()
+                if live_levels:
+                    return live_levels
             age = self._realtime.book_state.age_seconds()
             if age != float("inf"):
                 print_status(
                     f"Realtime book stale ({age:.1f}s). Falling back to REST.", "WARN"
                 )
 
+        if (
+            self._realtime
+            and self._snapshot_refresh_pending()
+            and self._snapshot_retry_delay() > 0
+        ):
+            raise BudaAPIError("Order book snapshot retry is cooling down")
+
+        snapshot_version = (
+            self._realtime.book_state.snapshot_version()
+            if self._realtime
+            else 0
+        )
+        if self._realtime:
+            self._last_snapshot_attempt_ts = time.monotonic()
         order_book = self.client.get_order_book(self.market_id)
         bids_raw = order_book.get("bids", [])
         asks_raw = order_book.get("asks", [])
         if self._realtime:
-            self._realtime.book_state.apply_snapshot(bids_raw, asks_raw)
+            applied = self._realtime.book_state.apply_snapshot_if_current(
+                snapshot_version, bids_raw, asks_raw
+            )
+            if applied:
+                self._last_sanity_ts = time.time()
+            if not applied:
+                live_levels = self._realtime_book_levels()
+                if live_levels:
+                    return live_levels
+                self._realtime.book_state.seed_snapshot_if_unready(
+                    bids_raw, asks_raw
+                )
+                live_levels = self._realtime_book_levels()
+                if live_levels:
+                    return live_levels
 
         bids = [parse_order_book_entry(entry) for entry in bids_raw]
         asks = [parse_order_book_entry(entry) for entry in asks_raw]
         bids.sort(key=lambda x: x[0], reverse=True)
         asks.sort(key=lambda x: x[0])
         return bids, asks
+
+    def _refresh_realtime_book_if_needed(self) -> None:
+        if not self._realtime:
+            return
+        now = time.monotonic()
+        if not self._snapshot_refresh_pending():
+            return
+        if self._snapshot_retry_delay(now) > 0:
+            return
+
+        try:
+            self._last_snapshot_attempt_ts = now
+            snapshot_version = self._realtime.book_state.snapshot_version()
+            order_book = self.client.get_order_book(self.market_id)
+            applied = self._realtime.book_state.apply_snapshot_if_current(
+                snapshot_version,
+                order_book.get("bids", []),
+                order_book.get("asks", []),
+            )
+            if not applied and self._realtime.book_state.needs_snapshot():
+                self._realtime.book_state.seed_snapshot_if_unready(
+                    order_book.get("bids", []),
+                    order_book.get("asks", []),
+                )
+            if applied:
+                self._last_sanity_ts = time.time()
+        except BudaAPIError as error:
+            print_status(f"Sanity check failed: {error}", "WARN")
+
+    def _snapshot_retry_delay(self, now: Optional[float] = None) -> float:
+        current = time.monotonic() if now is None else now
+        elapsed = current - self._last_snapshot_attempt_ts
+        return max(self._snapshot_retry_interval - elapsed, 0.0)
+
+    def _snapshot_refresh_pending(self) -> bool:
+        if not self._realtime:
+            return False
+        sanity_due = time.time() - self._last_sanity_ts >= self._sanity_interval
+        return self._realtime.book_state.needs_snapshot() or sanity_due
+
+    def _realtime_wait_timeout(self) -> float:
+        if not self._snapshot_refresh_pending():
+            return float(self.interval)
+        return min(float(self.interval), self._snapshot_retry_delay())
 
     def _strategy_label(self) -> str:
         if self.strategy == "depth":
@@ -335,12 +436,115 @@ class TradingBot:
         asks: List[Tuple[Decimal, Decimal]],
         best_bid: Decimal,
         best_ask: Decimal,
+        own_price: Optional[Decimal] = None,
+        own_remaining_amount: Optional[Decimal] = None,
+        own_order_id: Optional[str] = None,
     ) -> Decimal:
         if self.strategy == "depth":
             return self.calculate_depth_price(side, bids, asks)
         if side == "buy":
-            return self.calculate_optimal_price(best_bid, best_ask)
-        return self.calculate_optimal_sell_price(best_bid, best_ask)
+            competing_bid = self._best_competing_price(
+                "buy",
+                bids,
+                own_price,
+                own_remaining_amount,
+                own_order_id,
+            )
+            if competing_bid is None:
+                if own_price is None:
+                    raise BudaAPIError("No bids in order book")
+                return own_price
+            return self.calculate_optimal_price(competing_bid, best_ask)
+
+        competing_ask = self._best_competing_price(
+            "sell",
+            asks,
+            own_price,
+            own_remaining_amount,
+            own_order_id,
+        )
+        if competing_ask is None:
+            if own_price is None:
+                raise BudaAPIError("No asks in order book")
+            return own_price
+        return self.calculate_optimal_sell_price(best_bid, competing_ask)
+
+    def _best_competing_price(
+        self,
+        side: str,
+        levels: List[Tuple[Decimal, Decimal]],
+        own_price: Optional[Decimal],
+        own_remaining_amount: Optional[Decimal],
+        own_order_id: Optional[str],
+    ) -> Optional[Decimal]:
+        """Return the best unambiguous price after excluding the active order."""
+        canceled_orders = self._recently_canceled_orders[side]
+        visible_prices = {price for price, _ in levels}
+        now = time.monotonic()
+        for order_id, canceled in tuple(canceled_orders.items()):
+            expired = now - canceled.recorded_at >= self._canceled_level_ttl
+            if expired or canceled.price not in visible_prices:
+                del canceled_orders[order_id]
+
+        canceled_by_price: dict[Decimal, Decimal] = {}
+        active_order_key = str(own_order_id) if own_order_id is not None else None
+        for canceled_order_id, canceled in canceled_orders.items():
+            if canceled_order_id == active_order_key:
+                continue
+            canceled_by_price[canceled.price] = (
+                canceled_by_price.get(canceled.price, Decimal("0"))
+                + canceled.remaining_amount
+            )
+
+        for price, visible_amount in levels:
+            expected_own_amount = canceled_by_price.get(price, Decimal("0"))
+            if price == own_price:
+                if own_remaining_amount is None:
+                    return None
+                expected_own_amount += max(
+                    own_remaining_amount, Decimal("0")
+                )
+            if expected_own_amount == 0:
+                return price
+            if visible_amount != expected_own_amount:
+                return None
+        return None
+
+    def _remember_canceled_level(
+        self,
+        side: str,
+        order_id: Optional[str],
+        price: Decimal,
+        remaining_amount: Decimal,
+    ) -> None:
+        """Remember canceled volume until it disappears or its grace expires."""
+        if self.strategy != "top" or not order_id or remaining_amount <= 0:
+            return
+        self._recently_canceled_orders[side][str(order_id)] = _CanceledLevel(
+            price=price,
+            remaining_amount=remaining_amount,
+            recorded_at=time.monotonic(),
+        )
+
+    def _account_terminal_fill_once(
+        self,
+        side: str,
+        order_id: Optional[str],
+        traded_crypto: Decimal,
+        traded_clp: Decimal,
+    ) -> bool:
+        """Account a terminal order at most once, even if replacement fails."""
+        if order_id and order_id in self._accounted_terminal_orders:
+            return False
+        if order_id:
+            self._accounted_terminal_orders.add(order_id)
+        if traded_crypto <= 0:
+            return False
+        if side == "sell":
+            self.update_sell_execution_tracking(traded_crypto, traded_clp)
+        else:
+            self.update_execution_tracking(traded_crypto, traded_clp)
+        return True
 
     @staticmethod
     def _parse_order_state(order: dict) -> Tuple[str, Decimal, Decimal, Decimal]:
@@ -722,6 +926,9 @@ class TradingBot:
         self._running = True
         clp_amount = Decimal(str(clp_amount))
         self._active_side = "buy"
+        self._recently_canceled_orders["buy"].clear()
+        self._accounted_terminal_orders.clear()
+        self._last_snapshot_attempt_ts = 0.0
 
         # Initialize execution tracking
         self._total_clp_target = clp_amount
@@ -800,25 +1007,16 @@ class TradingBot:
             while self._running:
                 try:
                     if self._realtime:
-                        self._realtime.book_state.wait_for_top_change(self.interval)
+                        self._realtime.book_state.wait_for_top_change(
+                            self._realtime_wait_timeout()
+                        )
                     else:
                         time.sleep(self.interval)
 
                     if not self._running:
                         break
 
-                    if self._realtime and time.time() - self._last_sanity_ts >= self._sanity_interval:
-                        try:
-                            order_book = self.client.get_order_book(self.market_id)
-                            self._realtime.book_state.apply_snapshot(
-                                order_book.get("bids", []),
-                                order_book.get("asks", [])
-                            )
-                            self._last_sanity_ts = time.time()
-                        except BudaAPIError as e:
-                            print_status(
-                                f"Sanity check failed: {e}", "WARN"
-                            )
+                    self._refresh_realtime_book_if_needed()
 
                     # Check order state
                     state, traded_crypto, order_price, traded_clp = self.get_order_state(
@@ -835,7 +1033,9 @@ class TradingBot:
 
                     if state == "traded":
                         # Order fully executed - update tracking and finish
-                        self.update_execution_tracking(traded_crypto, traded_clp)
+                        self._account_terminal_fill_once(
+                            "buy", order_id, traded_crypto, traded_clp
+                        )
                         print_status("Order fully executed!", "OK")
                         self._current_order_id = None
                         self.print_final_summary()
@@ -845,8 +1045,10 @@ class TradingBot:
                         # Partial execution + canceled (can happen from external cancel)
                         print_status(
                             "Order was partially executed and canceled.", "WARN")
-                        self.update_execution_tracking(traded_crypto, traded_clp)
-                        self.print_progress()
+                        if self._account_terminal_fill_once(
+                            "buy", order_id, traded_crypto, traded_clp
+                        ):
+                            self.print_progress()
                         self._current_order_id = None
 
                         # Check if we can continue
@@ -862,8 +1064,24 @@ class TradingBot:
                         if not bids or not asks:
                             raise BudaAPIError("Order book empty")
                         best_bid, best_ask = bids[0][0], asks[0][0]
+                        canceled_remaining_amount = max(
+                            amount - traded_crypto, Decimal("0")
+                        )
                         target_price = self.calculate_strategy_price(
-                            "buy", bids, asks, best_bid, best_ask
+                            "buy",
+                            bids,
+                            asks,
+                            best_bid,
+                            best_ask,
+                            own_price=current_price,
+                            own_remaining_amount=canceled_remaining_amount,
+                            own_order_id=order_id,
+                        )
+                        self._remember_canceled_level(
+                            "buy",
+                            order_id,
+                            current_price,
+                            canceled_remaining_amount,
                         )
                         amount = self.calculate_crypto_amount(
                             remaining_clp, target_price)
@@ -888,31 +1106,42 @@ class TradingBot:
                     if not bids or not asks:
                         raise BudaAPIError("Order book empty")
                     best_bid, best_ask = bids[0][0], asks[0][0]
+                    own_remaining_amount = max(
+                        amount - traded_crypto, Decimal("0")
+                    )
                     target_price = self.calculate_strategy_price(
-                        "buy", bids, asks, best_bid, best_ask
+                        "buy",
+                        bids,
+                        asks,
+                        best_bid,
+                        best_ask,
+                        own_price=current_price,
+                        own_remaining_amount=own_remaining_amount,
+                        own_order_id=order_id,
                     )
 
-                    if self.strategy == "top" and current_price >= best_bid:
-                        print_status(
-                            f"Still best bid at {format_clp(current_price)} "
-                            f"(market: {format_clp(best_bid)})",
-                            "OK"
-                        )
-                    elif self.strategy != "top" and current_price == target_price:
-                        print_status(
-                            f"Still at target price {format_clp(current_price)} "
-                            f"(strategy: {self._strategy_label()})",
-                            "OK"
-                        )
+                    if current_price == target_price:
+                        if self.strategy == "top":
+                            print_status(
+                                f"Still at optimal bid {format_clp(current_price)}",
+                                "OK",
+                            )
+                        else:
+                            print_status(
+                                f"Still at target price {format_clp(current_price)} "
+                                f"(strategy: {self._strategy_label()})",
+                                "OK",
+                            )
                     else:
                         if time.time() - self._last_action_ts < self._min_action_interval:
                             continue
 
                         if self.strategy == "top":
                             print_status(
-                                f"Outbid! Our price: {format_clp(current_price)}, "
-                                f"Best bid: {format_clp(best_bid)}",
-                                "WARN"
+                                f"Top bid target moved. Our price: "
+                                f"{format_clp(current_price)}, new target: "
+                                f"{format_clp(target_price)}",
+                                "WARN",
                             )
                         else:
                             print_status(
@@ -930,11 +1159,20 @@ class TradingBot:
                         # Re-fetch order state after cancellation to capture any partial fills
                         state, traded_crypto, order_price, traded_clp = self.get_order_state(
                             order_id)
+                        canceled_remaining_amount = max(
+                            amount - traded_crypto, Decimal("0")
+                        )
+                        self._remember_canceled_level(
+                            "buy",
+                            order_id,
+                            current_price,
+                            canceled_remaining_amount,
+                        )
 
                         # Track any execution that happened before cancellation
-                        if traded_crypto > 0:
-                            self.update_execution_tracking(
-                                traded_crypto, traded_clp)
+                        if self._account_terminal_fill_once(
+                            "buy", order_id, traded_crypto, traded_clp
+                        ):
                             print_status(
                                 f"Partial execution before cancel: {self._fmt(traded_crypto)}", "INFO")
                             self.print_progress()
@@ -947,10 +1185,8 @@ class TradingBot:
                             self.print_final_summary()
                             return
 
-                        # Recalculate price and amount with remaining CLP
-                        target_price = self.calculate_strategy_price(
-                            "buy", bids, asks, best_bid, best_ask
-                        )
+                        # Keep the own-aware target calculated before canceling.
+                        # The public book can still show the canceled order briefly.
                         amount = self.calculate_crypto_amount(
                             remaining_clp, target_price)
 
@@ -986,6 +1222,9 @@ class TradingBot:
         self._running = True
         crypto_amount = Decimal(str(crypto_amount))
         self._active_side = "sell"
+        self._recently_canceled_orders["sell"].clear()
+        self._accounted_terminal_orders.clear()
+        self._last_snapshot_attempt_ts = 0.0
 
         # Initialize execution tracking
         self._total_crypto_target = crypto_amount
@@ -1070,25 +1309,16 @@ class TradingBot:
             while self._running:
                 try:
                     if self._realtime:
-                        self._realtime.book_state.wait_for_top_change(self.interval)
+                        self._realtime.book_state.wait_for_top_change(
+                            self._realtime_wait_timeout()
+                        )
                     else:
                         time.sleep(self.interval)
 
                     if not self._running:
                         break
 
-                    if self._realtime and time.time() - self._last_sanity_ts >= self._sanity_interval:
-                        try:
-                            order_book = self.client.get_order_book(self.market_id)
-                            self._realtime.book_state.apply_snapshot(
-                                order_book.get("bids", []),
-                                order_book.get("asks", [])
-                            )
-                            self._last_sanity_ts = time.time()
-                        except BudaAPIError as e:
-                            print_status(
-                                f"Sanity check failed: {e}", "WARN"
-                            )
+                    self._refresh_realtime_book_if_needed()
 
                     # Check order state
                     state, traded_crypto, order_price, traded_clp = self.get_order_state(
@@ -1105,8 +1335,9 @@ class TradingBot:
 
                     if state == "traded":
                         # Order fully executed - update tracking and finish
-                        self.update_sell_execution_tracking(
-                            traded_crypto, traded_clp)
+                        self._account_terminal_fill_once(
+                            "sell", order_id, traded_crypto, traded_clp
+                        )
                         print_status("Order fully executed!", "OK")
                         self._current_order_id = None
                         self.print_sell_final_summary()
@@ -1116,9 +1347,10 @@ class TradingBot:
                         # Partial execution + canceled (can happen from external cancel)
                         print_status(
                             "Order was partially executed and canceled.", "WARN")
-                        self.update_sell_execution_tracking(
-                            traded_crypto, traded_clp)
-                        self.print_sell_progress()
+                        if self._account_terminal_fill_once(
+                            "sell", order_id, traded_crypto, traded_clp
+                        ):
+                            self.print_sell_progress()
                         self._current_order_id = None
 
                         remaining_crypto = self._total_crypto_target - \
@@ -1133,8 +1365,24 @@ class TradingBot:
                         if not bids or not asks:
                             raise BudaAPIError("Order book empty")
                         best_bid, best_ask = bids[0][0], asks[0][0]
+                        canceled_remaining_amount = max(
+                            amount - traded_crypto, Decimal("0")
+                        )
                         target_price = self.calculate_strategy_price(
-                            "sell", bids, asks, best_bid, best_ask
+                            "sell",
+                            bids,
+                            asks,
+                            best_bid,
+                            best_ask,
+                            own_price=current_price,
+                            own_remaining_amount=canceled_remaining_amount,
+                            own_order_id=order_id,
+                        )
+                        self._remember_canceled_level(
+                            "sell",
+                            order_id,
+                            current_price,
+                            canceled_remaining_amount,
                         )
                         amount = self.quantize_crypto_amount(remaining_crypto)
                         print_status(
@@ -1159,31 +1407,42 @@ class TradingBot:
                     if not bids or not asks:
                         raise BudaAPIError("Order book empty")
                     best_bid, best_ask = bids[0][0], asks[0][0]
+                    own_remaining_amount = max(
+                        amount - traded_crypto, Decimal("0")
+                    )
                     target_price = self.calculate_strategy_price(
-                        "sell", bids, asks, best_bid, best_ask
+                        "sell",
+                        bids,
+                        asks,
+                        best_bid,
+                        best_ask,
+                        own_price=current_price,
+                        own_remaining_amount=own_remaining_amount,
+                        own_order_id=order_id,
                     )
 
-                    if self.strategy == "top" and current_price <= best_ask:
-                        print_status(
-                            f"Still best ask at {format_clp(current_price)} "
-                            f"(market: {format_clp(best_ask)})",
-                            "OK"
-                        )
-                    elif self.strategy != "top" and current_price == target_price:
-                        print_status(
-                            f"Still at target price {format_clp(current_price)} "
-                            f"(strategy: {self._strategy_label()})",
-                            "OK"
-                        )
+                    if current_price == target_price:
+                        if self.strategy == "top":
+                            print_status(
+                                f"Still at optimal ask {format_clp(current_price)}",
+                                "OK",
+                            )
+                        else:
+                            print_status(
+                                f"Still at target price {format_clp(current_price)} "
+                                f"(strategy: {self._strategy_label()})",
+                                "OK",
+                            )
                     else:
                         if time.time() - self._last_action_ts < self._min_action_interval:
                             continue
 
                         if self.strategy == "top":
                             print_status(
-                                f"Outasked! Our price: {format_clp(current_price)}, "
-                                f"Best ask: {format_clp(best_ask)}",
-                                "WARN"
+                                f"Top ask target moved. Our price: "
+                                f"{format_clp(current_price)}, new target: "
+                                f"{format_clp(target_price)}",
+                                "WARN",
                             )
                         else:
                             print_status(
@@ -1199,10 +1458,19 @@ class TradingBot:
 
                         state, traded_crypto, order_price, traded_clp = self.get_order_state(
                             order_id)
+                        canceled_remaining_amount = max(
+                            amount - traded_crypto, Decimal("0")
+                        )
+                        self._remember_canceled_level(
+                            "sell",
+                            order_id,
+                            current_price,
+                            canceled_remaining_amount,
+                        )
 
-                        if traded_crypto > 0:
-                            self.update_sell_execution_tracking(
-                                traded_crypto, traded_clp)
+                        if self._account_terminal_fill_once(
+                            "sell", order_id, traded_crypto, traded_clp
+                        ):
                             print_status(
                                 f"Partial execution before cancel: {self._fmt(traded_crypto)}", "INFO")
                             self.print_sell_progress()
@@ -1215,9 +1483,8 @@ class TradingBot:
                             self.print_sell_final_summary()
                             return
 
-                        target_price = self.calculate_strategy_price(
-                            "sell", bids, asks, best_bid, best_ask
-                        )
+                        # Keep the own-aware target calculated before canceling.
+                        # The public book can still show the canceled order briefly.
                         amount = self.quantize_crypto_amount(remaining_crypto)
 
                         print_status(

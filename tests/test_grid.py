@@ -15,6 +15,7 @@ from src.grid import (
 )
 from src.grid_types import GridConfig, GridConfigError, GridLevel, GridOrder
 from src.market import MarketConfig
+from src.ws import RealtimeClient
 
 
 def make_market(
@@ -44,6 +45,7 @@ class FakeClient:
         self.balances = balances or {"clp": Decimal("1000000"), "btc": Decimal("0.1")}
         self.create_calls: list[dict] = []
         self.cancel_calls: list[str] = []
+        self.book_calls = 0
         self._orders = orders or {}
         self._next_id = 1
         self._mid_price = mid_price
@@ -53,6 +55,7 @@ class FakeClient:
         return {"available_amount": [str(amount), currency.upper()]}
 
     def get_order_book(self, market_id):
+        self.book_calls += 1
         bid = self._mid_price - Decimal("1")
         ask = self._mid_price + Decimal("1")
         return {"bids": [[str(bid), "1"]], "asks": [[str(ask), "1"]]}
@@ -249,6 +252,96 @@ class TestVerifyBalances(unittest.TestCase):
     def test_within_budget_passes(self):
         bot = self._make_bot(balances={"clp": Decimal("10000000")})
         bot._verify_balances()
+
+
+class TestRealtimeSnapshotFallback(unittest.TestCase):
+    def test_resync_request_triggers_rest_snapshot_before_sanity_interval(self):
+        market = make_market()
+        config = GridConfig(
+            market_config=market,
+            lower_price=Decimal("90000000"),
+            upper_price=Decimal("110000000"),
+            range_pct=None,
+            levels=5,
+            quote_budget=Decimal("500000"),
+            max_open_orders=4,
+            interval=10,
+        )
+        client = FakeClient()
+        realtime = RealtimeClient(market.market_id)
+        realtime.book_state.reset()
+        bot = GridTradingBot(client=client, config=config, register_signals=False)
+        bot._realtime = realtime
+        bot._last_sanity_ts = time.time()
+
+        bot._refresh_realtime_book_if_needed()
+
+        self.assertEqual(client.book_calls, 1)
+        self.assertFalse(realtime.book_state.needs_snapshot())
+        self.assertEqual(
+            realtime.book_state.get_best(),
+            (Decimal("99999999"), Decimal("100000001")),
+        )
+
+    def test_resync_wait_is_capped_by_retry_delay(self):
+        market = make_market()
+        config = GridConfig(
+            market_config=market,
+            lower_price=Decimal("90000000"),
+            upper_price=Decimal("110000000"),
+            range_pct=None,
+            levels=5,
+            quote_budget=Decimal("500000"),
+            max_open_orders=4,
+            interval=10,
+        )
+        bot = GridTradingBot(
+            client=FakeClient(), config=config, register_signals=False
+        )
+        bot._realtime = RealtimeClient(market.market_id)
+        bot._realtime.book_state.reset()
+        bot._last_snapshot_attempt_ts = time.monotonic()
+
+        timeout = bot._realtime_wait_timeout()
+
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, bot._snapshot_retry_interval)
+        self.assertLess(timeout, bot.interval)
+
+    def test_delta_during_sanity_fetch_keeps_sanity_pending(self):
+        market = make_market()
+        realtime = RealtimeClient(market.market_id)
+        realtime.book_state.apply_snapshot(
+            [["99999999", "1"]], [["100000001", "1"]]
+        )
+
+        class SanityRaceClient(FakeClient):
+            def get_order_book(inner_self, market_id):
+                realtime.book_state.apply_change("bid", "99999999", "1")
+                return super().get_order_book(market_id)
+
+        config = GridConfig(
+            market_config=market,
+            lower_price=Decimal("90000000"),
+            upper_price=Decimal("110000000"),
+            range_pct=None,
+            levels=5,
+            quote_budget=Decimal("500000"),
+            max_open_orders=4,
+            interval=10,
+        )
+        client = SanityRaceClient()
+        bot = GridTradingBot(client=client, config=config, register_signals=False)
+        bot._realtime = realtime
+        bot._last_sanity_ts = 123.0
+
+        bot._refresh_realtime_book_if_needed()
+
+        self.assertEqual(bot._last_sanity_ts, 123.0)
+        self.assertEqual(client.book_calls, 1)
+        self.assertLessEqual(
+            bot._realtime_wait_timeout(), bot._snapshot_retry_interval
+        )
 
 
 class TestMirrorLogic(unittest.TestCase):

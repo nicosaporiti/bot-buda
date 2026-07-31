@@ -172,6 +172,8 @@ class GridTradingBot:
         self._realtime: Optional[RealtimeClient] = None
         self._last_sanity_ts = 0.0
         self._sanity_interval = 120.0
+        self._last_snapshot_attempt_ts = 0.0
+        self._snapshot_retry_interval = max(min(float(self.interval), 5.0), 1.0)
         self._last_action_ts = 0.0
         self._min_action_interval = 0.5
 
@@ -234,28 +236,109 @@ class GridTradingBot:
             self._realtime.stop()
             self._realtime = None
 
+    def _realtime_book_levels(
+        self,
+    ) -> Optional[Tuple[List[Tuple[Decimal, Decimal]], List[Tuple[Decimal, Decimal]]]]:
+        if not self._realtime:
+            return None
+        bids, asks = self._realtime.book_state.get_snapshot()
+        if not bids or not asks:
+            return None
+        return (
+            sorted(bids.items(), key=lambda item: item[0], reverse=True),
+            sorted(asks.items(), key=lambda item: item[0]),
+        )
+
     def _get_book_levels(
         self,
     ) -> Tuple[List[Tuple[Decimal, Decimal]], List[Tuple[Decimal, Decimal]]]:
         if self._realtime:
             max_age = max(self.interval * 3, 1.0)
             if not self._realtime.book_state.is_stale(max_age):
-                bids_dict, asks_dict = self._realtime.book_state.get_snapshot()
-                if bids_dict and asks_dict:
-                    bids = sorted(bids_dict.items(), key=lambda x: x[0], reverse=True)
-                    asks = sorted(asks_dict.items(), key=lambda x: x[0])
-                    return bids, asks
+                live_levels = self._realtime_book_levels()
+                if live_levels:
+                    return live_levels
 
+        if (
+            self._realtime
+            and self._snapshot_refresh_pending()
+            and self._snapshot_retry_delay() > 0
+        ):
+            raise BudaAPIError("Reintento de snapshot del book en espera")
+
+        snapshot_version = (
+            self._realtime.book_state.snapshot_version()
+            if self._realtime
+            else 0
+        )
+        if self._realtime:
+            self._last_snapshot_attempt_ts = time.monotonic()
         order_book = self.client.get_order_book(self.market_id)
         bids_raw = order_book.get("bids", [])
         asks_raw = order_book.get("asks", [])
         if self._realtime:
-            self._realtime.book_state.apply_snapshot(bids_raw, asks_raw)
+            applied = self._realtime.book_state.apply_snapshot_if_current(
+                snapshot_version, bids_raw, asks_raw
+            )
+            if applied:
+                self._last_sanity_ts = time.time()
+            if not applied:
+                live_levels = self._realtime_book_levels()
+                if live_levels:
+                    return live_levels
+                self._realtime.book_state.seed_snapshot_if_unready(
+                    bids_raw, asks_raw
+                )
+                live_levels = self._realtime_book_levels()
+                if live_levels:
+                    return live_levels
         bids = [parse_order_book_entry(e) for e in bids_raw]
         asks = [parse_order_book_entry(e) for e in asks_raw]
         bids.sort(key=lambda x: x[0], reverse=True)
         asks.sort(key=lambda x: x[0])
         return bids, asks
+
+    def _refresh_realtime_book_if_needed(self) -> None:
+        if not self._realtime:
+            return
+        now = time.monotonic()
+        if not self._snapshot_refresh_pending():
+            return
+        if self._snapshot_retry_delay(now) > 0:
+            return
+
+        try:
+            self._last_snapshot_attempt_ts = now
+            snapshot_version = self._realtime.book_state.snapshot_version()
+            order_book = self.client.get_order_book(self.market_id)
+            applied = self._realtime.book_state.apply_snapshot_if_current(
+                snapshot_version,
+                order_book.get("bids", []), order_book.get("asks", [])
+            )
+            if not applied and self._realtime.book_state.needs_snapshot():
+                self._realtime.book_state.seed_snapshot_if_unready(
+                    order_book.get("bids", []), order_book.get("asks", [])
+                )
+            if applied:
+                self._last_sanity_ts = time.time()
+        except BudaAPIError as error:
+            print_status(f"Sanity check fallo: {error}", "WARN")
+
+    def _snapshot_retry_delay(self, now: Optional[float] = None) -> float:
+        current = time.monotonic() if now is None else now
+        elapsed = current - self._last_snapshot_attempt_ts
+        return max(self._snapshot_retry_interval - elapsed, 0.0)
+
+    def _snapshot_refresh_pending(self) -> bool:
+        if not self._realtime:
+            return False
+        sanity_due = time.time() - self._last_sanity_ts >= self._sanity_interval
+        return self._realtime.book_state.needs_snapshot() or sanity_due
+
+    def _realtime_wait_timeout(self) -> float:
+        if not self._snapshot_refresh_pending():
+            return float(self.interval)
+        return min(float(self.interval), self._snapshot_retry_delay())
 
     def _get_current_price(self) -> Decimal:
         """Mid-price if both sides available; fallback to ticker last_price."""
@@ -757,25 +840,16 @@ class GridTradingBot:
         while self._running:
             try:
                 if self._realtime:
-                    self._realtime.book_state.wait_for_top_change(self.interval)
+                    self._realtime.book_state.wait_for_top_change(
+                        self._realtime_wait_timeout()
+                    )
                 else:
                     time.sleep(self.interval)
 
                 if not self._running:
                     break
 
-                if (
-                    self._realtime
-                    and time.time() - self._last_sanity_ts >= self._sanity_interval
-                ):
-                    try:
-                        ob = self.client.get_order_book(self.market_id)
-                        self._realtime.book_state.apply_snapshot(
-                            ob.get("bids", []), ob.get("asks", [])
-                        )
-                        self._last_sanity_ts = time.time()
-                    except BudaAPIError as e:
-                        print_status(f"Sanity check fallo: {e}", "WARN")
+                self._refresh_realtime_book_if_needed()
 
                 # Refresh + react.
                 for order in list(self._orders.values()):
