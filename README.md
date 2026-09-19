@@ -1,11 +1,11 @@
 # Bot de Trading para Buda.com
 
-Bot en Python para operar en [Buda.com](https://www.buda.com) con órdenes límite que se reposicionan automáticamente para mantener la mejor posición en el order book.
+Bot en Python para operar en [Buda.com](https://www.buda.com) con órdenes de mercado de ejecución inmediata y órdenes límite que se reposicionan automáticamente para mantener la mejor posición en el order book.
 
 Incluye:
 - modo interactivo TUI (menú en terminal),
 - modo CLI con subcomandos,
-- estrategias de precio `top` y `depth`,
+- estrategias de precio `top`, `depth` y `market`,
 - estrategia de grilla (`grid`) con rango manual o automático,
 - order book en tiempo real por WebSocket con fallback a REST,
 - tracking de ejecuciones parciales con resumen final.
@@ -67,7 +67,7 @@ python3 -m src.main
 
 Desde la TUI puedes:
 - comprar o vender cualquier crypto disponible,
-- elegir estrategia (`top`/`depth`),
+- elegir estrategia (`top`/`depth`/`market`),
 - configurar intervalo y `dry-run`,
 - ingresar montos en moneda quote (CLP/COP/PEN), USD o crypto (conversión automática usando ticker),
 - consultar balances y order book.
@@ -171,6 +171,41 @@ python3 -m src.main grid btc \
 - No incorpora fees en el cálculo de PnL; el resumen muestra PnL bruto.
 
 ## Estrategias de precio
+
+### `market`
+
+Ejecuta una operación inmediata, sin reposicionamientos. Las compras usan una
+cotización de precio reservado de Buda para fijar el monto quote; las ventas
+envían una única orden de mercado nativa. Disponible desde la TUI y el CLI:
+
+```bash
+python3 -m src.main buy btc 100000 --strategy market --dry-run
+python3 -m src.main sell btc 0.001 --strategy market --dry-run
+```
+
+Quita `--dry-run` para ejecutar la operación real.
+
+- **Compra:** el monto sigue expresado en moneda quote. El bot solicita una
+  cotización `bid_given_value`, rechaza cotizaciones incompletas o que excedan
+  el monto indicado y confirma el precio reservado. La comisión informada por
+  Buda es adicional y también debe caber en el saldo disponible.
+- **Venta:** envía la cantidad de cripto indicada, redondeada a la precisión del mercado.
+- Verifica saldo y mínimo de operación. Si no hay suficiente profundidad para
+  cotizar la compra completa, no la confirma.
+- Sigue el estado de la misma orden hasta finalizar; una cancelación o ejecución
+  parcial no genera otra orden por el remanente. El resumen usa los montos realmente
+  transados, antes de comisiones.
+- `--interval` controla las consultas de estado (entre 0.5 y 5 segundos);
+  no hay reposicionamiento. `--depth` no afecta el precio de mercado.
+- Tras tres errores consecutivos al consultar el estado, el monitoreo termina
+  conservando el ID para que la operación pueda verificarse manualmente.
+- `--dry-run` valida y muestra la cantidad, sin publicar órdenes ni simular fills.
+- Ante timeout o error de conexión al crear/confirmar una cotización o enviar
+  una venta, no reintenta automáticamente: revisa tus órdenes en Buda antes de
+  volver a ejecutar el comando.
+
+Contratos de órdenes y unidades: [documentación oficial de Buda](https://api.buda.com/#obtener-mis-ordenes)
+y [órdenes de precio reservado](https://api.buda.com/#nueva-orden-de-precio-reservado).
 
 ### `top` (default)
 

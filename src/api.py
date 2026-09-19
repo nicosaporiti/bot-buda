@@ -55,7 +55,8 @@ class BudaClient:
         method: str,
         endpoint: str,
         body: Optional[dict] = None,
-        authenticated: bool = True
+        authenticated: bool = True,
+        retry_network_errors: bool = True,
     ) -> dict:
         """
         Make an HTTP request to the Buda API.
@@ -144,24 +145,42 @@ class BudaClient:
 
                 # Return successful response
                 if response.text:
-                    return response.json()
+                    try:
+                        payload = response.json()
+                    except ValueError as error:
+                        raise BudaAPIError(
+                            self._invalid_success_response_message(method),
+                            status_code=response.status_code,
+                        ) from error
+                    if not isinstance(payload, dict):
+                        raise BudaAPIError(
+                            self._invalid_success_response_message(method),
+                            status_code=response.status_code,
+                        )
+                    return payload
                 return {}
 
             except requests.exceptions.Timeout:
-                if attempt < self._max_retries - 1:
+                if retry_network_errors and attempt < self._max_retries - 1:
                     print(f"Request timeout. Retrying in {self._retry_delay}s...")
                     time.sleep(self._retry_delay)
                     continue
                 raise BudaAPIError("Request timeout after multiple retries.")
 
             except requests.exceptions.ConnectionError as e:
-                if attempt < self._max_retries - 1:
+                if retry_network_errors and attempt < self._max_retries - 1:
                     print(f"Connection error. Retrying in {self._retry_delay}s...")
                     time.sleep(self._retry_delay)
                     continue
                 raise BudaAPIError(f"Connection error: {e}")
 
         raise BudaAPIError("Max retries exceeded.")
+
+    @staticmethod
+    def _invalid_success_response_message(method: str) -> str:
+        if method.upper() in {"POST", "PUT", "DELETE"}:
+            return "Successful response was invalid; mutation result is ambiguous."
+        return "Successful response was invalid."
 
     def get_balance(self, currency: str) -> dict:
         """
@@ -282,6 +301,53 @@ class BudaClient:
             body=body
         )
         return response.get("order", response)
+
+    def create_market_order(self, market_id: str, order_type: str, amount: str) -> dict:
+        """Submit once on transport failure: execution may already have occurred."""
+        response = self._make_request(
+            "POST",
+            f"/markets/{market_id.lower()}/orders",
+            body={"type": order_type, "price_type": "market", "amount": str(amount)},
+            retry_network_errors=False,
+        )
+        return response.get("order", response)
+
+    def create_reserved_price_order(
+        self,
+        market_id: str,
+        quotation_type: str,
+        amount: str,
+    ) -> dict:
+        """Create a fixed quote without retrying an ambiguous submission."""
+        response = self._make_request(
+            "POST",
+            "/reserved_price_orders",
+            body={
+                "market_name": market_id.lower(),
+                "amount": str(amount),
+                "quotation_type": quotation_type,
+                "payment_type": "immediate",
+            },
+            retry_network_errors=False,
+        )
+        return response.get("reserved_price_order", response)
+
+    def confirm_reserved_price_order(self, reserved_order_id: str) -> dict:
+        """Confirm a reserved quote once; a transport failure is ambiguous."""
+        response = self._make_request(
+            "PUT",
+            f"/reserved_price_orders/{reserved_order_id}",
+            body={"state": "commited"},
+            retry_network_errors=False,
+        )
+        return response.get("reserved_price_order", response)
+
+    def get_reserved_price_order(self, reserved_order_id: str) -> dict:
+        """Get the current state of a reserved-price order."""
+        response = self._make_request(
+            "GET", f"/reserved_price_orders/{reserved_order_id}"
+        )
+        return response.get("reserved_price_order", response)
 
     def get_order(self, order_id: str) -> dict:
         """

@@ -31,6 +31,8 @@ class _CanceledLevel:
 class TradingBot:
     """Bot for placing and maintaining best bid/ask orders on Buda.com."""
 
+    _MAX_CONSECUTIVE_MONITOR_ERRORS = 3
+
     def __init__(
         self,
         client: BudaClient,
@@ -60,12 +62,13 @@ class TradingBot:
         self.depth_ratio = Decimal(str(depth_ratio))
         self.min_amount = market_config.min_order_amount
 
-        if self.strategy not in {"top", "depth"}:
+        if self.strategy not in {"top", "depth", "market"}:
             raise BudaAPIError(f"Unknown strategy: {self.strategy}")
         if not (Decimal("0") < self.depth_ratio <= Decimal("1")):
             raise BudaAPIError("Depth ratio must be between 0 and 1")
 
         self._current_order_id: Optional[str] = None
+        self._current_reserved_order_id: Optional[str] = None
         self._running = False
         self._realtime: Optional[RealtimeClient] = None
         self._last_action_ts = 0.0
@@ -108,6 +111,25 @@ class TradingBot:
         print_status("Interrupt received. Cleaning up...", "WARN")
         self._running = False
         self._stop_realtime()
+
+        if self._current_reserved_order_id and not self.dry_run:
+            try:
+                reserved_order = self.client.get_reserved_price_order(
+                    self._current_reserved_order_id
+                )
+                if reserved_order.get("state") == "confirmed":
+                    self._account_reserved_buy(reserved_order)
+                    self._current_reserved_order_id = None
+                elif reserved_order.get("state") not in {"quoted", "rejected"}:
+                    print_status(
+                        "Reserved buy may still be executing; verify it in Buda.",
+                        "WARN",
+                    )
+            except BudaAPIError as error:
+                print_status(
+                    f"Could not verify reserved buy: {error}. Check it in Buda.",
+                    "ERROR",
+                )
 
         if self._current_order_id and not self.dry_run:
             try:
@@ -555,10 +577,10 @@ class TradingBot:
             traded = traded[0]
         traded_crypto = Decimal(str(traded))
 
-        limit = order.get("limit", ["0"])
+        limit = order.get("limit") or ["0"]
         if isinstance(limit, list):
             limit = limit[0]
-        order_price = Decimal(str(limit))
+        order_price = Decimal(str(limit or "0"))
 
         total_exchanged = order.get("total_exchanged", ["0"])
         if isinstance(total_exchanged, list):
@@ -916,6 +938,237 @@ class TradingBot:
                 f"Remaining (not executed): {self._fmt(remaining)}", "WARN")
         print_status("=" * 50, "INFO")
 
+    def _market_buy_amount(self, budget: Decimal) -> Decimal:
+        """Estimate base size by consuming asks within the quote budget."""
+        _, asks = self.get_order_book_levels()
+        remaining = budget
+        amount = Decimal("0")
+        for price, volume in asks:
+            if price <= 0 or volume <= 0:
+                continue
+            taken = min(volume, remaining / price)
+            amount += taken
+            remaining -= taken * price
+            if remaining <= 0:
+                return self.quantize_crypto_amount(amount)
+        raise BudaAPIError("Insufficient ask liquidity to estimate market purchase")
+
+    @staticmethod
+    def _money_amount(value, field_name: str) -> Decimal:
+        """Read the numeric component of an API Money value."""
+        if isinstance(value, list):
+            value = value[0] if value else None
+        try:
+            amount = Decimal(str(value))
+        except Exception as error:
+            raise BudaAPIError(
+                f"Reserved price response has invalid {field_name}"
+            ) from error
+        if not amount.is_finite() or amount < 0:
+            raise BudaAPIError(
+                f"Reserved price response has invalid {field_name}"
+            )
+        return amount
+
+    def _validate_reserved_buy_quote(
+        self, quote: dict, budget: Decimal
+    ) -> Tuple[str, Decimal, Decimal, Decimal]:
+        """Validate a reserved buy before it can be confirmed."""
+        quote_id = quote.get("id")
+        if not quote_id:
+            raise BudaAPIError("Reserved price response missing ID")
+        if quote.get("state") != "quoted":
+            raise BudaAPIError(
+                f"Reserved price quote is not confirmable: {quote.get('state', 'unknown')}"
+            )
+        if quote.get("quotation_incomplete"):
+            raise BudaAPIError("Insufficient liquidity for the requested market purchase")
+
+        base_amount = self._money_amount(quote.get("base_amount"), "base amount")
+        quote_amount = self._money_amount(quote.get("quote_amount"), "quote amount")
+        fee = self._money_amount(quote.get("fee", ["0"]), "fee")
+        if base_amount < self.min_amount:
+            raise BudaAPIError(
+                f"Order amount is below minimum {self._fmt(self.min_amount)}"
+            )
+        if quote_amount <= 0 or quote_amount > budget:
+            raise BudaAPIError("Reserved price quote exceeds the requested budget")
+        return str(quote_id), base_amount, quote_amount, fee
+
+    def _account_reserved_buy(self, reserved_order: dict) -> None:
+        """Account the fixed amounts of a confirmed reserved-price buy."""
+        base_amount = self._money_amount(
+            reserved_order.get("base_amount"), "base amount"
+        )
+        quote_amount = self._money_amount(
+            reserved_order.get("quote_amount"), "quote amount"
+        )
+        reserved_id = reserved_order.get("id", self._current_reserved_order_id)
+        self._account_terminal_fill_once(
+            "buy", f"reserved:{reserved_id}", base_amount, quote_amount
+        )
+
+    def _record_monitor_error(
+        self,
+        order_label: str,
+        order_id: Optional[str],
+        error: BudaAPIError,
+        consecutive_errors: int,
+    ) -> int:
+        consecutive_errors += 1
+        print_status(
+            f"Cannot check {order_label} {order_id}: {error} "
+            f"({consecutive_errors}/{self._MAX_CONSECUTIVE_MONITOR_ERRORS})",
+            "WARN",
+        )
+        if consecutive_errors >= self._MAX_CONSECUTIVE_MONITOR_ERRORS:
+            self._running = False
+            raise BudaAPIError(
+                f"Monitoring {order_label} {order_id} stopped after "
+                f"{consecutive_errors} consecutive errors; verify it in Buda."
+            ) from error
+        return consecutive_errors
+
+    def _monitor_reserved_market_buy(self, reserved_order: dict) -> None:
+        """Follow a confirmed reserved-price buy through its terminal state."""
+        consecutive_errors = 0
+        while self._running:
+            state = reserved_order.get("state", "unknown")
+            if state == "confirmed":
+                self._account_reserved_buy(reserved_order)
+                self._current_reserved_order_id = None
+                self._running = False
+                print_status("Reserved market buy finished: confirmed", "OK")
+                self.print_final_summary()
+                return
+            if state == "rejected":
+                self._current_reserved_order_id = None
+                self._running = False
+                reason = reserved_order.get("rejection_reason") or "unknown reason"
+                print_status(f"Reserved market buy rejected: {reason}", "WARN")
+                self.print_final_summary()
+                return
+
+            time.sleep(max(min(self.interval, 5), 0.5))
+            if not self._running:
+                return
+            try:
+                reserved_order = self.client.get_reserved_price_order(
+                    self._current_reserved_order_id
+                )
+            except BudaAPIError as error:
+                consecutive_errors = self._record_monitor_error(
+                    "reserved buy",
+                    self._current_reserved_order_id,
+                    error,
+                    consecutive_errors,
+                )
+            else:
+                consecutive_errors = 0
+
+    def _execute_reserved_market_buy(self, budget: Decimal) -> None:
+        """Buy against a fixed quote-denominated budget."""
+        available = self.verify_balance(budget)
+        if self.dry_run:
+            amount = self._market_buy_amount(budget)
+            if amount < self.min_amount:
+                raise BudaAPIError(
+                    f"Order amount is below minimum {self._fmt(self.min_amount)}"
+                )
+            print_status(f"Estimated market buy: {self._fmt(amount)}", "INFO")
+            print_status("DRY RUN - No market order placed", "WARN")
+            self._running = False
+            return
+
+        try:
+            quote = self.client.create_reserved_price_order(
+                self.market_id, "bid_given_value", str(budget)
+            )
+        except BudaAPIError:
+            print_status(
+                "Check reserved-price orders in Buda before retrying.", "WARN"
+            )
+            raise
+
+        quote_id, base_amount, quote_amount, fee = self._validate_reserved_buy_quote(
+            quote, budget
+        )
+        if quote_amount + fee > available:
+            raise BudaAPIError(
+                "Insufficient balance for the reserved quote plus its fee"
+            )
+
+        self._current_reserved_order_id = quote_id
+        print_status(
+            f"Reserved market buy: {self._fmt(base_amount)} for "
+            f"{format_clp(quote_amount)} plus {format_clp(fee)} fee",
+            "INFO",
+        )
+        try:
+            reserved_order = self.client.confirm_reserved_price_order(quote_id)
+        except BudaAPIError:
+            print_status(
+                "Confirmation result is unknown; check the reserved order in Buda.",
+                "WARN",
+            )
+            raise
+        self._monitor_reserved_market_buy(reserved_order)
+
+    def _execute_market_sell(self, requested: Decimal) -> None:
+        if not requested.is_finite() or requested <= 0:
+            raise BudaAPIError("Amount must be finite and positive")
+        amount = self.quantize_crypto_amount(requested)
+        self.verify_crypto_balance(amount)
+        if amount < self.min_amount:
+            raise BudaAPIError(f"Order amount is below minimum {self._fmt(self.min_amount)}")
+        print_status(f"Market sell: {self._fmt(amount)}", "INFO")
+        print_status("Variable execution price; final proceeds may vary.", "WARN")
+        if self.dry_run:
+            print_status("DRY RUN - No market order placed", "WARN")
+            self._running = False
+            return
+        try:
+            order = self.client.create_market_order(
+                self.market_id, "Ask", str(amount)
+            )
+        except BudaAPIError:
+            print_status("Check orders in Buda before retrying; submission may have succeeded.", "WARN")
+            raise
+        self._current_order_id = order.get("id")
+        if not self._current_order_id:
+            raise BudaAPIError("Market response missing order ID; check orders in Buda before retrying")
+        print_status(f"Market order ID: {self._current_order_id}", "OK")
+        self._monitor_market_sell(order)
+
+    def _monitor_market_sell(self, order: dict) -> None:
+        terminal_states = {"traded", "canceled", "canceled_and_traded", "unprepared"}
+        consecutive_errors = 0
+        while self._running:
+            state, traded, _, exchanged = self._parse_order_state(order)
+            if state in terminal_states:
+                self._account_terminal_fill_once(
+                    "sell", self._current_order_id, traded, exchanged
+                )
+                self._current_order_id = None
+                self._running = False
+                print_status(f"Market order finished: {state}", "OK" if state == "traded" else "WARN")
+                self.print_sell_final_summary()
+                return
+            time.sleep(max(min(self.interval, 5), 0.5))
+            if not self._running:
+                return
+            try:
+                order = self.client.get_order(self._current_order_id)
+            except BudaAPIError as error:
+                consecutive_errors = self._record_monitor_error(
+                    "market order",
+                    self._current_order_id,
+                    error,
+                    consecutive_errors,
+                )
+            else:
+                consecutive_errors = 0
+
     def execute_buy_order(self, clp_amount: Decimal) -> None:
         """
         Execute the main trading loop.
@@ -934,6 +1187,12 @@ class TradingBot:
         self._total_clp_target = clp_amount
         self._total_clp_executed = Decimal("0")
         self._total_crypto_received = Decimal("0")
+
+        if self.strategy == "market":
+            if not clp_amount.is_finite() or clp_amount <= 0:
+                raise BudaAPIError("Amount must be finite and positive")
+            self._execute_reserved_market_buy(clp_amount)
+            return
 
         # Validate minimum CLP amount for this market (estimated dynamically)
         min_clp = self._estimate_min_clp()
@@ -1230,6 +1489,10 @@ class TradingBot:
         self._total_crypto_target = crypto_amount
         self._total_crypto_executed = Decimal("0")
         self._total_clp_received = Decimal("0")
+
+        if self.strategy == "market":
+            self._execute_market_sell(crypto_amount)
+            return
 
         if crypto_amount < self.min_amount:
             raise BudaAPIError(

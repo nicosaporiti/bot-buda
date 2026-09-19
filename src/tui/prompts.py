@@ -42,6 +42,7 @@ def _prompt_strategy() -> tuple[str, Decimal]:
     strategy = inquirer.select(
         message="Estrategia de precio:",
         choices=[
+            {"name": "Mercado (ejecucion inmediata)", "value": "market"},
             {"name": "Top of book (mejor posicion)", "value": "top"},
             {"name": "Depth-based (profundidad de mercado)", "value": "depth"},
         ],
@@ -179,7 +180,7 @@ def prompt_buy_params(
         raw_amount = Decimal(amount_str)
 
     strategy, depth_ratio = _prompt_strategy()
-    interval = _prompt_interval()
+    interval = 1 if strategy == "market" else _prompt_interval()
     dry_run = _prompt_dry_run()
 
     return {
@@ -249,7 +250,7 @@ def prompt_sell_params(
         raw_amount = Decimal(amount_str)
 
     strategy, depth_ratio = _prompt_strategy()
-    interval = _prompt_interval()
+    interval = 1 if strategy == "market" else _prompt_interval()
     dry_run = _prompt_dry_run()
 
     return {

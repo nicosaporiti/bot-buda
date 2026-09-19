@@ -132,7 +132,12 @@ def print_order_summary(console: Console, params: dict) -> None:
     """Print a confirmation panel before executing an order."""
     side = params.get("side", "buy")
     currency = params["currency"].upper()
-    strategy = "Top of book" if params["strategy"] == "top" else f"Depth-based (ratio: {params['depth_ratio']})"
+    if params["strategy"] == "market":
+        strategy = "Mercado (ejecucion inmediata)"
+    elif params["strategy"] == "depth":
+        strategy = f"Depth-based (ratio: {params['depth_ratio']})"
+    else:
+        strategy = "Top of book"
 
     lines = []
     lines.append(f"[bold]Side:[/bold] {'Comprar' if side == 'buy' else 'Vender'}")
@@ -144,6 +149,8 @@ def print_order_summary(console: Console, params: dict) -> None:
         lines.append(f"[bold]Monto:[/bold] {format_clp(params['amount'])}")
     else:
         lines.append(f"[bold]Cantidad:[/bold] {format_crypto(params['amount'], currency)}")
+    if params["strategy"] == "market":
+        lines.append("[yellow]Precio variable, sin limite. El gasto final puede variar.[/yellow]")
     lines.append(f"[bold]Estrategia:[/bold] {strategy}")
     lines.append(f"[bold]Intervalo:[/bold] {params['interval']}s")
     lines.append(f"[bold]Dry run:[/bold] {'Si' if params['dry_run'] else 'No'}")

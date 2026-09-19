@@ -65,9 +65,9 @@ Examples:
         "--strategy",
         "-s",
         type=str,
-        choices=["top", "depth"],
+        choices=["top", "depth", "market"],
         default="top",
-        help="Pricing strategy: top (best bid/ask) or depth (cumulative volume)"
+        help="Pricing strategy: top (best bid/ask) depth (cumulative volume), or market (immediate execution)"
     )
     buy_parser.add_argument(
         "--depth",
@@ -105,9 +105,9 @@ Examples:
         "--strategy",
         "-s",
         type=str,
-        choices=["top", "depth"],
+        choices=["top", "depth", "market"],
         default="top",
-        help="Pricing strategy: top (best bid/ask) or depth (cumulative volume)"
+        help="Pricing strategy: top (best bid/ask) depth (cumulative volume), or market (immediate execution)"
     )
     sell_parser.add_argument(
         "--depth",
