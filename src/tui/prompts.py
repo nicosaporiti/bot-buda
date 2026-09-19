@@ -6,14 +6,24 @@ from InquirerPy import inquirer
 from InquirerPy.separator import Separator
 
 
+def execute_with_voice_shortcut(prompt):
+    """Return the voice action when Ctrl+T interrupts a navigation prompt."""
+    @prompt.register_kb("c-t")
+    def voice(event):
+        event.app.exit(result="voice")
+
+    return prompt.execute()
+
+
 def prompt_main_menu() -> str:
     """Show the main menu and return the selected action."""
-    result = inquirer.select(
-        message="Selecciona una opcion:",
+    prompt = inquirer.select(
+        message="Selecciona una opcion (Ctrl+T: hablar):",
         choices=[
             {"name": "Comprar", "value": "buy"},
             {"name": "Vender", "value": "sell"},
             {"name": "Grilla", "value": "grid"},
+            {"name": "Asistente (texto y voz)", "value": "assistant"},
             Separator(),
             {"name": "Ver Balances", "value": "balance"},
             {"name": "Ver Order Book", "value": "orderbook"},
@@ -21,8 +31,8 @@ def prompt_main_menu() -> str:
             {"name": "Salir", "value": "exit"},
         ],
         default="buy",
-    ).execute()
-    return result
+    )
+    return execute_with_voice_shortcut(prompt)
 
 
 def _prompt_currency(currencies: list[str]) -> str | None:

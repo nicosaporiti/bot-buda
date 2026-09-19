@@ -70,7 +70,10 @@ def launch_tui() -> int:
             return 0
 
         try:
-            if action == "buy":
+            if action in ("assistant", "voice"):
+                from .assistant import launch_assistant
+                launch_assistant(console, client, registry, start_with_voice=action == "voice")
+            elif action == "buy":
                 _handle_buy(console, client, registry, usd_unit_available, quote_decimals)
             elif action == "sell":
                 _handle_sell(console, client, registry, usd_unit_available, quote_decimals)

@@ -22,9 +22,16 @@ Los comandos `buy` y `sell` publican y cancelan órdenes reales cuando no usas `
 ## Instalación
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-voice.txt
 cp .env.example .env
 ```
+
+El entorno `.venv` aísla las dependencias, igual que en bot-zesty. En cada terminal
+nueva, ejecutá `source .venv/bin/activate` antes de iniciar el bot. Para instalar
+sin micrófono, usá `requirements.txt` en lugar de `requirements-voice.txt`.
+Si ya tenés `.env`, conservá ese archivo en lugar de copiar el ejemplo encima.
 
 Configura `.env`:
 
@@ -104,6 +111,74 @@ python3 -m src.main balance clp      # Balance específico
 python3 -m src.main orderbook btc-clp
 python3 -m src.main orderbook usdc-clp
 ```
+
+## Asistente de texto y voz (Groq)
+
+El menú **Asistente (texto y voz)** permite consultar saldos, puntas y los primeros
+niveles del libro, y preparar compras o ventas con `top`, `depth` o `market`.
+Usa los mismos motores y conversiones que la TUI manual.
+
+Configurá estas variables en `.env` (para Groq, el entorno tiene prioridad):
+
+```env
+GROQ_API_KEY=tu_clave_de_groq
+GROQ_MODEL=openai/gpt-oss-20b
+```
+
+Para texto alcanza la instalación normal. Para voz:
+
+```bash
+source .venv/bin/activate
+python -m pip install -r requirements-voice.txt
+python -m src.main
+```
+
+En macOS, permití acceso al micrófono a la terminal desde los ajustes del sistema.
+En Linux puede ser necesario instalar PortAudio (`libportaudio2`). Sin la dependencia
+de audio, podés seguir escribiendo; sin clave Groq, los menús manuales siguen funcionando.
+
+**Ctrl+T** desde el menú principal o el menú del asistente abre directamente el
+dictado, sin seleccionar **Hablar**. También podés elegir **Escribir pedido** o
+**Hablar** dentro del asistente. El atajo no está activo en formularios, revisiones
+ni durante la ejecución de una estrategia. Al grabar, **Enter** o
+**Ctrl+T** termina y **Escape/Ctrl+C** descarta. La captura termina automáticamente
+a los 30 segundos. El dictado se transcribe en español con `whisper-large-v3-turbo`,
+se muestra y se envía automáticamente al asistente. No hay escucha permanente ni
+respuestas habladas. El dictado incluye contexto de criptomonedas para ayudar a
+reconocer siglas: podés decir «Bitcoin», «USD Coin» o «Tether», o deletrear
+«be te ce», «u ese de ce» y «u ese de te». El asistente tiene instrucciones de
+pedir aclaración ante siglas ambiguas, sin confundir USD con USDC o USDT.
+Durante la transcripción, Ctrl+C cancela la espera y vuelve
+al menú; el audio puede haber llegado a Groq.
+
+Ejemplos:
+
+- «¿Cuánto USDC tengo disponible?»
+- «Mostrame las puntas de bitcoin».
+- «Prepará una compra de bitcoin por 10000 CLP usando top en simulación».
+- «Prepará una venta real de 0.001 BTC a mercado».
+
+Los pedidos deben indicar moneda, importe, unidad y estrategia. Si falta información,
+el asistente debe pedirla. Se validan localmente los parámetros y las unidades;
+CLP, COP y PEN no son intercambiables. USD se convierte usando el mercado USDC
+como aproximación, igual que en la TUI manual.
+
+**Preparar no envía una orden.** El resumen muestra mercado, importe convertido,
+estrategia, intervalo y modo real/simulación. La confirmación se hace exclusivamente
+por teclado y tiene **No** como opción predeterminada. Decir «confirmar» en el chat
+no ejecuta operaciones. Si no pedís modo real, el asistente prepara una simulación.
+Los defaults son 30 segundos de monitoreo (1 para mercado); `depth` requiere ratio.
+
+El asistente queda en pausa mientras se ejecuta el bot; Ctrl+C conserva el mecanismo
+existente de detención y limpieza. Las grillas y el control de estrategias en ejecución
+se manejan desde el menú principal. Esta versión no incorpora control de estrategias por voz.
+
+Groq recibe el pedido, hasta tres intercambios recientes acotados, las monedas
+habilitadas y los datos necesarios de las consultas. Las credenciales de Buda no
+se incluyen. El audio y el historial no se guardan en disco por esta aplicación.
+**Limpiar conversación** borra el historial; también se borra después de revisar
+una operación y al salir del asistente. Las llamadas a Groq consumen la cuota de tu
+cuenta, también en simulación. Los fallos de Groq no se reintentan automáticamente.
 
 ## Estrategia de grilla (`grid`)
 
