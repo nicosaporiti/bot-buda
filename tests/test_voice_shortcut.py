@@ -50,15 +50,39 @@ class VoiceShortcutTests(unittest.TestCase):
         self.assertEqual(events, ['record', 'menu'])
         model.transcribe.assert_called_once_with(b'wav')
 
-    def test_main_menu_routes_shortcut_to_immediate_voice(self):
+    def test_launch_opens_full_screen_account(self):
         from src.tui.app import launch_tui
         tools = make_tools()
         config = Mock(quote_currency='clp')
         with patch('src.tui.app.Config.load', return_value=config), \
                 patch('src.tui.app.BudaClient', return_value=tools.client), \
                 patch('src.tui.app.MarketRegistry', return_value=tools.registry), \
-                patch('src.tui.app.Console', return_value=Console(file=io.StringIO())), \
-                patch('src.tui.app.prompt_main_menu', side_effect=['voice', 'exit']), \
-                patch('src.tui.assistant.launch_assistant') as launch:
+                patch('src.tui.dashboard.BudaApp') as app:
             self.assertEqual(launch_tui(), 0)
-            self.assertTrue(launch.call_args.kwargs['start_with_voice'])
+            app.assert_called_once_with(tools.client, tools.registry)
+            app.return_value.run.assert_called_once()
+
+    def test_grid_prompt_runs_outside_dashboard_event_loop(self):
+        import asyncio
+        from src.tui.app import launch_tui
+
+        tools = make_tools()
+
+        def grid(console, client, registry):
+            with self.assertRaises(RuntimeError):
+                asyncio.get_running_loop()
+            # Exercise a real InquirerPy prompt with cancellation by default.
+            with create_pipe_input() as pipe:
+                with create_app_session(input=pipe, output=DummyOutput()):
+                    pipe.send_text('\r')
+                    self.assertFalse(inquirer.confirm(message='Confirmar', default=False).execute())
+
+        with patch('src.tui.app.Config.load', return_value=Mock(quote_currency='clp')), \
+                patch('src.tui.app.BudaClient', return_value=tools.client), \
+                patch('src.tui.app.MarketRegistry', return_value=tools.registry), \
+                patch('src.tui.dashboard.BudaApp') as app, \
+                patch('src.tui.app._handle_grid', side_effect=grid) as handler:
+            app.return_value.run.side_effect = ['grid', None]
+            self.assertEqual(launch_tui(), 0)
+            handler.assert_called_once()
+            self.assertEqual(app.return_value.run.call_count, 2)

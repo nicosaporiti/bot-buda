@@ -3,6 +3,7 @@ import json
 import re
 from dataclasses import dataclass
 from decimal import Decimal
+from threading import Event, Lock
 
 from .market import MarketRegistry
 
@@ -170,9 +171,13 @@ class Assistant:
         self.model = model
         self.tools = tools
         self.turns = []
+        self._history_lock = Lock()
+        self._history_version = 0
 
     def clear(self) -> None:
-        self.turns.clear()
+        with self._history_lock:
+            self._history_version += 1
+            self.turns.clear()
 
     def remember(self, prompt: str, answer: str) -> None:
         self.turns.append([{'role': 'user', 'content': prompt},
@@ -180,25 +185,42 @@ class Assistant:
         while len(self.turns) > 3 or sum(len(m['content']) for t in self.turns for m in t) > 6000:
             self.turns.pop(0)
 
-    def reply(self, prompt: str) -> str | PreparedOrder:
+    def reply(self, prompt: str, *, cancelled: Event | None = None) -> str | PreparedOrder:
+        with self._history_lock:
+            version = self._history_version
+            history = [message for turn in self.turns for message in turn]
+
+        def check_active():
+            if (cancelled is not None and cancelled.is_set()) or version != self._history_version:
+                raise AssistantError('Consulta cancelada.')
+
+        def remember_answer(answer):
+            with self._history_lock:
+                check_active()
+                self.remember(prompt, answer)
+
+        check_active()
         if not prompt.strip() or len(prompt) > 2000:
             raise AssistantError('El pedido debe tener entre 1 y 2000 caracteres.')
         context = json.dumps({'quote_currency': self.tools.registry.quote_currency,
                               'currencies': self.tools.registry.currencies()})
         messages = [{'role': 'system', 'content': SYSTEM_PROMPT},
                     {'role': 'system', 'content': 'Mercados disponibles: ' + context}]
-        messages.extend(message for turn in self.turns for message in turn)
+        messages.extend(history)
         messages.append({'role': 'user', 'content': prompt})
         for _ in range(4):
+            check_active()
             message = self.model.complete(messages, self.tools.definitions)
+            check_active()
             calls = message.get('tool_calls')
             if not calls:
                 answer = message.get('content')
                 if not isinstance(answer, str) or not answer.strip():
                     raise AssistantError('Groq devolvió una respuesta vacía.')
-                self.remember(prompt, answer)
+                remember_answer(answer)
                 return answer
             name, arguments = parse_tool_call(calls)
+            check_active()
             try:
                 result = self.tools.execute(name, arguments)
             except AssistantError as error:
@@ -206,8 +228,9 @@ class Assistant:
                     raise
                 result = {'validation_error': str(error), 'order_prepared': False,
                           'instruction': 'Revisá el pedido original y la unidad del importe. No cambies el importe para evitar el error. Si es ambiguo, pedí aclaración.'}
+            check_active()
             if isinstance(result, PreparedOrder):
-                self.remember(prompt, 'Se preparó una revisión local. No se confirma ejecución desde el chat.')
+                remember_answer('Se preparó una revisión local. No se confirma ejecución desde el chat.')
                 return result
             messages.append({'role': 'assistant', 'content': None, 'tool_calls': calls})
             messages.append({'role': 'tool', 'tool_call_id': calls[0]['id'],

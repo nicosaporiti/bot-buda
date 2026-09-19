@@ -3,7 +3,7 @@
 Bot en Python para operar en [Buda.com](https://www.buda.com) con órdenes de mercado de ejecución inmediata y órdenes límite que se reposicionan automáticamente para mantener la mejor posición en el order book.
 
 Incluye:
-- modo interactivo TUI (menú en terminal),
+- interfaz de pantalla completa con Textual, como bot-zesty,
 - modo CLI con subcomandos,
 - estrategias de precio `top`, `depth` y `market`,
 - estrategia de grilla (`grid`) con rango manual o automático,
@@ -66,7 +66,7 @@ Los montos mínimos por mercado se obtienen dinámicamente desde la API.
 
 ### 1) TUI interactiva (por defecto)
 
-Si ejecutas sin subcomando, se abre el menú interactivo:
+Si ejecutas sin subcomando, se abre la interfaz de cuenta con navegación lateral, panel central y barra de comandos:
 
 ```bash
 python3 -m src.main
@@ -78,6 +78,29 @@ Desde la TUI puedes:
 - configurar intervalo y `dry-run`,
 - ingresar montos en moneda quote (CLP/COP/PEN), USD o crypto (conversión automática usando ticker),
 - consultar balances y order book.
+
+La pantalla inicial muestra **Balances**. El lateral permite abrir **Nueva orden**,
+**Mis órdenes**, **Proceso**, **Libro de órdenes**, **Grilla** y **Asistente · AI**.
+Las consultas se ejecutan en segundo plano; las tablas se actualizan manualmente.
+Mis órdenes muestra la respuesta del mercado seleccionado, sin cargar páginas adicionales.
+El formulario de compra/venta inicia en **simulación** y valida importes y unidades.
+
+Atajos: **Ctrl+Q** salir, **Ctrl+R** actualizar la tabla actual, **Ctrl+L** enfocar
+la barra de comandos y **Ctrl+T** hablar. La barra acepta texto para el asistente o
+`/balances`, `/orden`, `/ordenes`, `/proceso`, `/libro`, `/grilla`, `/asistente`, `/limpiar` y `/ayuda`.
+
+La revisión de compras y ventas se muestra dentro del panel, con **Volver**
+seleccionado por defecto. Después de confirmar, **Proceso** muestra el registro
+continuo del bot, sus órdenes, ejecuciones parciales, errores y resumen final.
+**Detener orden** o **Ctrl+C** solicita la limpieza del bot sin cerrar la interfaz.
+**Ctrl+Q** durante una ejecución también pide detenerla; para salir, volvé a usarlo
+una vez finalizada la limpieza. No se inicia otra orden mientras haya una en curso.
+Los avisos del registro indican si es necesario verificar una cancelación en Buda.
+
+La voz se graba en un diálogo dentro del panel, con contador y botones para
+terminar/transcribir o descartar. La transcripción aparece en la conversación;
+la barra de estado distingue grabación, transcripción y consulta al asistente.
+Sólo la configuración/ejecución de grillas mantiene el flujo auxiliar de terminal.
 
 ### 2) CLI por subcomandos
 
@@ -137,10 +160,8 @@ En macOS, permití acceso al micrófono a la terminal desde los ajustes del sist
 En Linux puede ser necesario instalar PortAudio (`libportaudio2`). Sin la dependencia
 de audio, podés seguir escribiendo; sin clave Groq, los menús manuales siguen funcionando.
 
-**Ctrl+T** desde el menú principal o el menú del asistente abre directamente el
-dictado, sin seleccionar **Hablar**. También podés elegir **Escribir pedido** o
-**Hablar** dentro del asistente. El atajo no está activo en formularios, revisiones
-ni durante la ejecución de una estrategia. Al grabar, **Enter** o
+**Ctrl+T** o el botón **Hablar** abre directamente el dictado desde la pantalla
+principal. El atajo no interrumpe consultas ni operaciones en curso. Al grabar, **Enter** o
 **Ctrl+T** termina y **Escape/Ctrl+C** descarta. La captura termina automáticamente
 a los 30 segundos. El dictado se transcribe en español con `whisper-large-v3-turbo`,
 se muestra y se envía automáticamente al asistente. No hay escucha permanente ni
@@ -148,8 +169,9 @@ respuestas habladas. El dictado incluye contexto de criptomonedas para ayudar a
 reconocer siglas: podés decir «Bitcoin», «USD Coin» o «Tether», o deletrear
 «be te ce», «u ese de ce» y «u ese de te». El asistente tiene instrucciones de
 pedir aclaración ante siglas ambiguas, sin confundir USD con USDC o USDT.
-Durante la transcripción, Ctrl+C cancela la espera y vuelve
-al menú; el audio puede haber llegado a Groq.
+Durante la transcripción o consulta, Ctrl+C cancela la espera y mantiene abierto
+el panel; los datos enviados pueden haber llegado a Groq. Cancelar la transcripción
+evita que su resultado se envíe luego al asistente.
 
 Ejemplos:
 
@@ -368,7 +390,8 @@ bot-buda/
 - `websocket-client` — conexión WebSocket
 - `certifi` — verificación SSL
 - `rich` — formateo de terminal (colores, tablas, paneles)
-- `InquirerPy` — prompts interactivos para la TUI
+- `textual` — interfaz de cuenta de pantalla completa
+- `InquirerPy` — menús de terminal auxiliares y configuración de grillas
 
 ## Troubleshooting
 

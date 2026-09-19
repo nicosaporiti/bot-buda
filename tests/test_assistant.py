@@ -32,6 +32,67 @@ def tool_message(name, arguments):
 
 
 class AssistantTests(unittest.TestCase):
+    def test_cancel_before_thread_starts_skips_model(self):
+        from threading import Event
+
+        cancelled = Event()
+        cancelled.set()
+        model = Mock()
+        assistant = Assistant(model, make_tools())
+        with self.assertRaises(AssistantError):
+            assistant.reply('Pedido cancelado', cancelled=cancelled)
+        model.complete.assert_not_called()
+        self.assertEqual(assistant.turns, [])
+
+    def test_cancel_or_clear_discards_pending_reply_and_stops_tool_chain(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        for pending in ('answer', 'tool_call', 'tool_result'):
+            for action in ('cancel', 'clear'):
+                with self.subTest(pending=pending, action=action):
+                    started, release, cancelled = Event(), Event(), Event()
+                    tools = make_tools()
+                    model = Mock()
+                    assistant = Assistant(model, tools)
+
+                    def blocked_result(*args):
+                        started.set()
+                        if not release.wait(3):
+                            raise TimeoutError('Test did not release request')
+                        if pending == 'answer':
+                            return {'content': 'Respuesta vieja'}
+                        if pending == 'tool_call':
+                            return tool_message('consultar_saldo', {'currency': 'btc'})
+                        return {'available_amount': ['1', 'BTC']}
+
+                    if pending == 'tool_result':
+                        model.complete.return_value = tool_message('consultar_saldo', {'currency': 'btc'})
+                        tools.client.get_balance.side_effect = blocked_result
+                    else:
+                        model.complete.side_effect = blocked_result
+
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(assistant.reply, 'Viejo', cancelled=cancelled)
+                        try:
+                            self.assertTrue(started.wait(2))
+                            if action == 'cancel':
+                                cancelled.set()
+                            else:
+                                assistant.clear()
+                            model.complete.side_effect = None
+                            model.complete.return_value = {'content': 'Respuesta nueva'}
+                            self.assertEqual(assistant.reply('Nuevo'), 'Respuesta nueva')
+                        finally:
+                            release.set()
+                        with self.assertRaises(AssistantError):
+                            future.result(timeout=2)
+                    self.assertEqual(model.complete.call_count, 2)
+                    self.assertEqual(tools.client.get_balance.call_count, int(pending == 'tool_result'))
+                    self.assertEqual(assistant.turns, [[
+                        {'role': 'user', 'content': 'Nuevo'},
+                        {'role': 'assistant', 'content': 'Respuesta nueva'}]])
+
     def test_preparation_never_calls_trading_api(self):
         tools = make_tools()
         tools.client.reset_mock()

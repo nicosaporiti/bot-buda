@@ -47,9 +47,9 @@ def record_voice() -> bytes | None:
         recorder.discard()
 
 
-def review_order(console, client, registry, order: PreparedOrder) -> None:
-    """Only this UI path can dispatch an assistant-prepared order."""
-    from .app import _resolve_amount, _run_bot
+def prepare_review(console, client, registry, order: PreparedOrder) -> dict | None:
+    """Resolve and display the exact parameters that will be confirmed."""
+    from .app import _resolve_amount
     from .display import print_order_summary
 
     params = dict(order.params)
@@ -64,6 +64,16 @@ def review_order(console, client, registry, order: PreparedOrder) -> None:
     native_unit = market.quote_currency if params['side'] == 'buy' else market.base_currency
     params['converted_display'] = f'{amount} {native_unit.upper()}'
     print_order_summary(console, params)
+    return params
+
+
+def review_order(console, client, registry, order: PreparedOrder) -> None:
+    """Review from the standalone synchronous terminal menus."""
+    from .app import _run_bot
+
+    params = prepare_review(console, client, registry, order)
+    if params is None:
+        return
     if not inquirer.confirm(message='Confirmar y ejecutar esta operación?', default=False).execute():
         console.print('Operación descartada.', markup=False)
         return

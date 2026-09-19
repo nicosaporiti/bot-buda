@@ -9,10 +9,9 @@ from ..bot import TradingBot
 from ..config import Config, ConfigError
 from ..grid import GridTradingBot
 from ..grid_types import GridConfig, GridConfigError
-from ..market import MarketRegistry, KNOWN_DECIMALS
+from ..market import MarketRegistry
 from ..utils import format_clp, format_crypto
 from .display import (
-    print_header,
     print_balances_table,
     print_single_balance,
     print_order_book_table,
@@ -20,7 +19,6 @@ from .display import (
     print_grid_summary,
 )
 from .prompts import (
-    prompt_main_menu,
     prompt_buy_params,
     prompt_sell_params,
     prompt_grid_params,
@@ -51,43 +49,17 @@ def launch_tui() -> int:
         console.print(f"[red]Error cargando mercados:[/red] {e}")
         return 1
 
-    print_header(console)
+    from .dashboard import BudaApp
 
-    # Check if USDC market exists (for USD unit option)
-    usdc_market_id = f"usdc-{registry.quote_currency}"
-    usd_unit_available = registry.has_market(usdc_market_id)
-    quote_decimals = KNOWN_DECIMALS.get(registry.quote_currency, 0)
-
-    while True:
+    # Terminal prompts need their own event loop and the main thread for Ctrl+C.
+    while BudaApp(client, registry).run() == 'grid':
         try:
-            action = prompt_main_menu()
-        except KeyboardInterrupt:
-            console.print("\n[dim]Saliendo...[/dim]")
-            return 0
-
-        if action == "exit":
-            console.print("[dim]Hasta luego![/dim]")
-            return 0
-
-        try:
-            if action in ("assistant", "voice"):
-                from .assistant import launch_assistant
-                launch_assistant(console, client, registry, start_with_voice=action == "voice")
-            elif action == "buy":
-                _handle_buy(console, client, registry, usd_unit_available, quote_decimals)
-            elif action == "sell":
-                _handle_sell(console, client, registry, usd_unit_available, quote_decimals)
-            elif action == "grid":
-                _handle_grid(console, client, registry)
-            elif action == "balance":
-                _handle_balance(console, client)
-            elif action == "orderbook":
-                _handle_orderbook(console, client, registry)
-        except AuthenticationError:
-            console.print("[red]Error de autenticacion. Verifica tu API key y secret en .env[/red]")
-        except KeyboardInterrupt:
-            console.print("\n")
-            continue
+            _handle_grid(console, client, registry)
+        except (KeyboardInterrupt, EOFError):
+            console.print('Grilla cancelada.')
+        except Exception:
+            console.print('No se completó la grilla. Consultá las órdenes antes de repetir.')
+    return 0
 
 
 def _resolve_amount(console: Console, client: BudaClient, registry: MarketRegistry, params: dict) -> bool:
